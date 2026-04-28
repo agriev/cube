@@ -538,7 +538,7 @@ async fn test_join_cubes_on_wrong_field_error() {
 
     assert_eq!(
         query.unwrap_err().message(),
-        "Error during rewrite: Use __cubeJoinField to join Cubes. Please check logs for additional information.".to_string()
+        "Use __cubeJoinField to join Cubes".to_string()
     )
 }
 
@@ -562,11 +562,11 @@ async fn test_join_cubes_filter_from_wrong_side_error() {
 
     assert_eq!(
         query.unwrap_err().message(),
-        "Error during rewrite: Can not join Cubes. This is most likely due to one of the following reasons:\n\
+        "Can not join Cubes. This is most likely due to one of the following reasons:\n\
             • one of the cubes contains a group by\n\
             • one of the cubes contains a measure\n\
-            • the cube on the right contains a filter, sorting or limits\n\
-            . Please check logs for additional information.".to_string()
+            • the cube on the right contains a filter, sorting or limits\n"
+            .to_string()
     )
 }
 
@@ -589,11 +589,11 @@ async fn test_join_cubes_with_aggr_error() {
 
     assert_eq!(
         query.unwrap_err().message(),
-        "Error during rewrite: Can not join Cubes. This is most likely due to one of the following reasons:\n\
+        "Can not join Cubes. This is most likely due to one of the following reasons:\n\
             • one of the cubes contains a group by\n\
             • one of the cubes contains a measure\n\
-            • the cube on the right contains a filter, sorting or limits\n\
-            . Please check logs for additional information.".to_string()
+            • the cube on the right contains a filter, sorting or limits\n"
+            .to_string()
     )
 }
 

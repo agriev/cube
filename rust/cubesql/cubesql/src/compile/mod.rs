@@ -1754,7 +1754,7 @@ GROUP BY
 
         assert_eq!(
             create_query.err().unwrap().message(),
-            "Error during rewrite: Dimension 'customer_gender' was used with the aggregate function 'MEASURE()'. Please use a measure instead. Please check logs for additional information.",
+            "Dimension 'customer_gender' was used with the aggregate function 'MEASURE()'. Please use a measure instead",
         );
     }
 

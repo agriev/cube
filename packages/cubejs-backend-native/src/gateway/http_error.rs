@@ -43,13 +43,11 @@ impl HttpError {
         Self {
             code: match error.cause {
                 CubeErrorCauseType::User(_) => code,
-                CubeErrorCauseType::Internal(_) => {
-                    HttpErrorCode::StatusCode(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                }
+                _ => HttpErrorCode::StatusCode(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
             },
             message: match error.cause {
                 CubeErrorCauseType::User(_) => error.message,
-                CubeErrorCauseType::Internal(_) => "Internal Server Error".to_string(),
+                _ => "Internal Server Error".to_string(),
             },
         }
     }

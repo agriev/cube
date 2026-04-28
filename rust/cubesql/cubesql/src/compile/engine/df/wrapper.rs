@@ -681,7 +681,7 @@ impl CubeScanWrapperNode {
                     ))
                 })?
                 .get_sql_templates();
-            sql.finalize_query(sql_templates).map_err(|e| CubeError::internal(e.to_string()))?;
+            sql.finalize_query(sql_templates)?;
             Ok((sql, request, member_fields))
         })?;
         Ok(CubeScanWrappedSqlNode::new(
@@ -1208,7 +1208,7 @@ impl WrappedSelectNode {
                 }
 
                 if *distinct {
-                    return Err(CubeError::internal(
+                    return Err(CubeError::unsupported(
                         "Patch measure with DISTINCT flag is not supported".to_string(),
                     ));
                 }
@@ -3222,7 +3222,7 @@ impl WrappedSelectNode {
                     LogicalPlan::Extension(Extension { node }) => {
                         if let Some(join_cube_scan) = node.as_any().downcast_ref::<CubeScanNode>() {
                             if join_cube_scan.request.ungrouped == Some(true) {
-                                return Err(CubeError::internal(format!(
+                                return Err(CubeError::unsupported(format!(
                                     "Unsupported ungrouped CubeScan as join subquery: {join_cube_scan:?}"
                                 )));
                             }
@@ -3230,20 +3230,20 @@ impl WrappedSelectNode {
                             node.as_any().downcast_ref::<WrappedSelectNode>()
                         {
                             if wrapped_select.push_to_cube {
-                                return Err(CubeError::internal(format!(
+                                return Err(CubeError::unsupported(format!(
                                     "Unsupported push_to_cube WrappedSelect as join subquery: {wrapped_select:?}"
                                 )));
                             }
                         } else {
                             // TODO support more grouped cases here
-                            return Err(CubeError::internal(format!(
+                            return Err(CubeError::unsupported(format!(
                                 "Unsupported unknown extension as join subquery: {node:?}"
                             )));
                         }
                     }
                     _ => {
                         // TODO support more grouped cases here
-                        return Err(CubeError::internal(format!(
+                        return Err(CubeError::unsupported(format!(
                             "Unsupported logical plan node as join subquery: {lp:?}"
                         )));
                     }
@@ -3254,7 +3254,7 @@ impl WrappedSelectNode {
                         // Do nothing
                     }
                     _ => {
-                        return Err(CubeError::internal(format!(
+                        return Err(CubeError::unsupported(format!(
                             "Unsupported join type for join subquery: {join_type:?}"
                         )));
                     }
@@ -3387,7 +3387,7 @@ impl WrappedSelectNode {
                 JoinType::Left => generator.get_sql_templates().left_join()?,
                 JoinType::Inner => generator.get_sql_templates().inner_join()?,
                 _ => {
-                    return Err(CubeError::internal(format!(
+                    return Err(CubeError::unsupported(format!(
                         "Unsupported join type for join subquery: {join_type:?}"
                     )))
                 }
@@ -3651,7 +3651,7 @@ impl WrappedSelectNode {
         } = columns;
 
         if !patch_measures.is_empty() {
-            return Err(CubeError::internal(format!(
+            return Err(CubeError::unsupported(format!(
                 "Unexpected patch measures for non-push-to-Cube wrapped select: {patch_measures:?}",
             )));
         }

@@ -168,14 +168,14 @@ impl ValueObject for ResultWrapper {
         let value = match data {
             TransformedData::Compact { members, dataset } => {
                 let Some(row) = dataset.get(index) else {
-                    return Err(CubeError::user(format!(
+                    return Err(CubeError::internal(format!(
                         "Unexpected response from Cube, can't get {} row",
                         index
                     )));
                 };
 
                 let Some(member_index) = members.iter().position(|m| m == field_name) else {
-                    return Err(CubeError::user(format!(
+                    return Err(CubeError::internal(format!(
                         "Field name '{}' not found in members",
                         field_name
                     )));
@@ -185,7 +185,7 @@ impl ValueObject for ResultWrapper {
             }
             TransformedData::Vanilla(dataset) => {
                 let Some(row) = dataset.get(index) else {
-                    return Err(CubeError::user(format!(
+                    return Err(CubeError::internal(format!(
                         "Unexpected response from Cube, can't get {} row",
                         index
                     )));
