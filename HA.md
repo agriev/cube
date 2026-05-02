@@ -73,16 +73,26 @@ to whether replication is on. See [HA design plan](docs/ha/PLAN.md).
 
 | Milestone | Title | Status |
 |---|---|---|
-| M1 | `raft-rs` crate + `MetaCommand` enum scaffolding | **done** |
-| M2 | Single-node Raft with local RocksDB log | todo |
-| M3 | Wire all 86 `MetaStore` writes through the apply path | todo |
-| M4 | 3-node clustering, leader election, follower replication | todo |
+| M1 | `raft-rs` crate + `MetaCommand` enum scaffolding | ✅ **done** |
+| M2 | Single-node Raft with local RocksDB log | ✅ **done** |
+| M3 | Wire all `MetaStore` writes through the apply path | ✅ **done** (`m3-complete`) |
+| M4 | 3-node clustering, leader election, follower replication | next |
 | M5 | Snapshot + log compaction over `RemoteFs` | todo |
 | M6 | Leader-aware client routing (Cube API + workers) | todo |
 | M7 | Helm chart updates (`agriev/cube-stack-deployment`) | todo |
 | M8 | Chaos & soak tests (kill -9, drain, partition) | todo |
 | M9 | Observability (Prometheus metrics, Grafana dashboard) | todo |
 | M10 | Docs + migration guide from non-HA | todo |
+
+**M3 sub-milestone tags** (in chronological order):
+`m3.1-complete` → `m3.2-complete` → `m3.3.a-complete` →
+`m3.3.b.{1,2,3,4}-complete` → `m3.3.c-complete` →
+`m3.4.{a,b,b.1,b.2,c,d}-complete` →
+`m3.5.{a,b,c.1,c.2}-complete` → `m3.5-complete` →
+`m3.6-complete` → `m3-complete` → `m3.7-complete` →
+`m3.8-complete`. CI gates (codec + cubestore cargo check + raft
+test modules + cubestore-sql-tests under `CUBESTORE_HA_MODE=raft`)
+all green on the linux/x64 + macOS/arm64 self-hosted runners.
 
 Total estimated effort: **13–22 solo-engineer-weeks** to deployable MVP.
 
@@ -106,16 +116,38 @@ This is a **living fork**:
 
 ## Building / running
 
-For now, the fork builds identically to upstream Cube Store:
+The fork builds identically to upstream Cube Store:
 
 ```bash
 cd rust/cubestore
 cargo build --release
 ```
 
-The new `raft` module compiles but is unreachable code (no production code
-calls it yet — that wiring lands in M2). HA-mode envs (`CUBESTORE_HA_MODE`,
-`CUBESTORE_RAFT_PEERS`, etc.) are recognised but ignored.
+To run with HA mode (single-node post-M3):
+
+```bash
+CUBESTORE_HA_MODE=raft \
+CUBESTORE_NODE_ID=1 \
+./target/release/cubestored
+```
+
+The metastore now routes every write through Raft on the local node;
+the wrapper is `RaftMetaStore` (single-node only — multi-node clustering
+lands in M4). HA-mode envs `CUBESTORE_HA_MODE`, `CUBESTORE_NODE_ID`,
+`CUBESTORE_HA_RAFT_LOG_DIR` are wired into `Config::default()`.
+
+The HA mode is **not yet production-ready** — multi-node clustering
+(M4), snapshots (M5), leader-aware routing (M6) and the rest of the
+deployment story are still ahead.
+
+To run the SQL test suite under HA mode:
+
+```bash
+CUBESTORE_HA_MODE=raft cargo test \
+  --package cubestore-sql-tests --release --test in-process
+```
+
+CI runs this on every push to `ha-main`.
 
 ## Contact
 
