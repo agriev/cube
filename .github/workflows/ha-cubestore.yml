@@ -139,11 +139,16 @@ jobs:
           toolchain: nightly-2025-08-01
           components: rustfmt,clippy
 
+      - name: Install macOS build prereqs (protobuf)
+        # `raft-proto` (transitive from raft-rs) needs `protoc >= 3.1`.
+        # cmake comes with Xcode CLT but protoc doesn't, so brew it.
+        # `|| true` keeps the step idempotent across runs.
+        run: |
+          brew install protobuf || true
+          which protoc
+
       - name: cargo check (cubestore + tests)
         working-directory: rust/cubestore
-        # Mac dev machines already have cmake/clang/openssl via Xcode
-        # CLT + Homebrew on a typical setup. Don't try to install via
-        # apt-get (it doesn't exist).
         run: cargo check --package cubestore --tests --message-format=short
 
       - name: cargo test raft module (no networking, deterministic)
