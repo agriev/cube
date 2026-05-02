@@ -49,10 +49,11 @@
 //! leader before the propose. **Do not flip
 //! `CUBESTORE_HA_MODE=raft` (M3.5.c) until M3.4 is in.**
 
-use crate::metastore::{IdRow, MetaStore, RocksMetaStore, Schema, Table};
-use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult, MetaCommandResultMismatch};
+use crate::metastore::table::Table;
+use crate::metastore::{IdRow, MetaStore, RocksMetaStore, Schema};
+use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResultMismatch};
 use crate::raft::rocks_apply::RocksMetaStoreApply;
-use crate::raft::state_machine::{Apply, RaftError, RaftNode};
+use crate::raft::state_machine::{RaftError, RaftNode};
 use crate::CubeError;
 use std::path::Path;
 use std::sync::Arc;
@@ -75,7 +76,11 @@ impl RaftMetaStore {
         node_id: u64,
         store: Arc<RocksMetaStore>,
     ) -> Result<Arc<Self>, RaftError> {
-        let apply: Arc<dyn Apply> = Arc::new(RocksMetaStoreApply::new(store.clone()));
+        // Concrete-type Arc — `RaftNode::start_single_node` is generic
+        // over `A: Apply` (implicitly `Sized`), so an `Arc<dyn Apply>`
+        // would fail the size check. Concrete is also lighter — no
+        // vtable per propose.
+        let apply = Arc::new(RocksMetaStoreApply::new(store.clone()));
         let raft = RaftNode::start_single_node(raft_log_dir, node_id, apply)?;
         Ok(Arc::new(Self { raft, store }))
     }
