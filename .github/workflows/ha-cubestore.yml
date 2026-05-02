@@ -110,6 +110,52 @@ jobs:
           cargo test --package cubestore --lib raft::raft_meta_store::tests --release --no-fail-fast
           cargo test --package cubestore --lib config::ha_mode_tests --release --no-fail-fast
 
+  # Cross-arch portability: the cube docker images target multi-arch
+  # (linux/amd64 + linux/arm64). The macOS-arm64 self-hosted runner
+  # catches platform-specific issues (kqueue, mio, ARM64 codegen
+  # edges) before they bite real arm64 deployments. cargo check only —
+  # full sql-tests under macOS would duplicate the linux/x64 job
+  # without proportional bug-finding.
+  cubestore-check-macos-arm64:
+    name: cubestore cargo check (macOS arm64)
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: macos-arm64-cargo-${{ hashFiles('rust/cubestore/**/Cargo.lock') }}
+          restore-keys: |
+            macos-arm64-cargo-
+
+      - name: Install Rust toolchain pinned in rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-01
+          components: rustfmt,clippy
+
+      - name: cargo check (cubestore + tests)
+        working-directory: rust/cubestore
+        # Mac dev machines already have cmake/clang/openssl via Xcode
+        # CLT + Homebrew on a typical setup. Don't try to install via
+        # apt-get (it doesn't exist).
+        run: cargo check --package cubestore --tests --message-format=short
+
+      - name: cargo test raft module (no networking, deterministic)
+        working-directory: rust/cubestore
+        run: |
+          cargo test --package cubestore --lib raft::command::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::storage::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::state_machine::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::rocks_apply::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::raft_meta_store::tests --release --no-fail-fast
+          cargo test --package cubestore --lib config::ha_mode_tests --release --no-fail-fast
+
   # M3.6 — run a subset of cubestore-sql-tests under
   # `CUBESTORE_HA_MODE=raft` to verify the wrapper + dispatch works
   # end-to-end against the real SQL surface. Single-process tests
