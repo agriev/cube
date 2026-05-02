@@ -46,7 +46,7 @@ use crate::metastore::replay_handle::SeqPointer;
 use crate::metastore::source::SourceCredentials;
 use crate::metastore::table::StreamOffset;
 use crate::metastore::{
-    Chunk, Column, ImportFormat, IndexDef, MetaStore, Partition, RocksMetaStore,
+    Chunk, Column, IdRow, ImportFormat, IndexDef, MetaStore, Partition, RocksMetaStore,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult};
@@ -357,6 +357,26 @@ impl Apply for RocksMetaStoreApply {
                 Ok(MetaCommandResult::Unit)
             }
 
+            // ---- M3.7: insert_chunks + chunk_update_last_inserted ---------
+            MetaCommand::InsertChunks { chunks_blob } => {
+                let chunks: Vec<Chunk> = decode_typed_blob(&chunks_blob, "chunks_blob")?;
+                let rows = self.store.insert_chunks(chunks).await?;
+                wrap_id_row_list(IdRowKind::Chunk, &rows)
+            }
+            MetaCommand::ChunkUpdateLastInserted {
+                chunk_ids,
+                last_inserted_at_millis,
+            } => {
+                let last_inserted_at = decode_optional_millis(
+                    last_inserted_at_millis,
+                    "last_inserted_at_millis",
+                )?;
+                self.store
+                    .chunk_update_last_inserted(chunk_ids, last_inserted_at)
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+
             // ---- Tables: ready (M3.3.b.2) ---------------------------------
             MetaCommand::TableReady { table_id, is_ready } => {
                 let row = self.store.table_ready(table_id, is_ready).await?;
@@ -381,6 +401,11 @@ impl Apply for RocksMetaStoreApply {
                 let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
                 let row = self.store.update_heart_beat_with_now(job_id, now).await?;
                 wrap_id_row(IdRowKind::Job, &row)
+            }
+            // M3.7
+            MetaCommand::DeleteAllJobs => {
+                let rows = self.store.delete_all_jobs().await?;
+                wrap_id_row_list(IdRowKind::Job, &rows)
             }
             MetaCommand::AddJob { job_blob } => {
                 let job: Job = decode_typed_blob(&job_blob, "job_blob")?;
@@ -556,6 +581,34 @@ impl Apply for RocksMetaStoreApply {
                 Ok(MetaCommandResult::Unit)
             }
 
+            // ---- M3.7: commit_multi_partition_split ----------------------
+            MetaCommand::CommitMultiPartitionSplit {
+                multi_partition_id,
+                new_multi_partitions,
+                new_multi_partition_rows,
+                old_partitions_blob,
+                new_partitions_blob,
+                new_partition_rows,
+                initial_split,
+            } => {
+                let old_partitions: Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)> =
+                    decode_typed_blob(&old_partitions_blob, "old_partitions_blob")?;
+                let new_partitions: Vec<(IdRow<Partition>, u64)> =
+                    decode_typed_blob(&new_partitions_blob, "new_partitions_blob")?;
+                self.store
+                    .commit_multi_partition_split(
+                        multi_partition_id,
+                        new_multi_partitions,
+                        new_multi_partition_rows,
+                        old_partitions,
+                        new_partitions,
+                        new_partition_rows,
+                        initial_split,
+                    )
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+
             // ---- Still deferred -------------------------------------------
             MetaCommand::AcquirePartitionedLock { .. } => Err(not_yet_implemented(
                 "AcquirePartitionedLock",
@@ -619,6 +672,18 @@ fn wrap_id_row<T: serde::Serialize>(
     MetaCommandResult::id_row(kind, row).map_err(|e| {
         CubeError::internal(format!(
             "encode IdRow<{:?}> for apply result: {}",
+            kind, e
+        ))
+    })
+}
+
+fn wrap_id_row_list<T: serde::Serialize>(
+    kind: IdRowKind,
+    rows: &[T],
+) -> Result<MetaCommandResult, CubeError> {
+    MetaCommandResult::id_row_list(kind, rows).map_err(|e| {
+        CubeError::internal(format!(
+            "encode IdRowList<{:?}> for apply result: {}",
             kind, e
         ))
     })

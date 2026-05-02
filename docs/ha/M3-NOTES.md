@@ -108,13 +108,23 @@ heartbeat / time-based ones.
 | ↳ M3.6.a | CI job runs in_process under `CUBESTORE_HA_MODE=raft`; `Config::test` reads env var | ✅ done | 1 |
 
 **M3 fully complete (`m3-complete`).** The HA fork's metastore replication
-layer is end-to-end green: 51 of ~86 trait writes route through Raft (the
-critical-path subset; the remaining are local-fall-through writes that
-surfaced no SQL test breakage), the wrapper boots when
+layer is end-to-end green: the wrapper boots when
 `CUBESTORE_HA_MODE=raft` and replays writes deterministically across
 replicas (Chunk/Table/ReplayHandle/Job all leader-stamp `Utc::now()`),
 and the upstream cubestore-sql-tests `in-process` suite passes
 unchanged under HA mode in CI.
+
+**M3.7 (`m3.7-complete`)** closes the last batch of writes that were
+delegating to local store: `insert_chunks`, `delete_all_jobs`,
+`chunk_update_last_inserted`, `commit_multi_partition_split`. These
+now route through Raft via new `MetaCommand` variants and a new
+`MetaCommandResult::IdRowList` for the two `Vec<IdRow<...>>`
+returns. The two `prepare_multi_*` methods stay on local
+delegation — they're `read_operation` only despite their names.
+
+After M3.7: 55 of ~86 trait writes are routed; the remaining 31 are
+read methods (which correctly delegate locally) plus the two
+`prepare_multi_*` reads.
 
 Next milestones are M4 (multi-node clustering + leader election),
 M5 (snapshots + log compaction), M6 (leader-aware client routing),

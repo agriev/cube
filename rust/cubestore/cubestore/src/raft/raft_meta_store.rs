@@ -645,8 +645,6 @@ impl MetaStore for RaftMetaStore {
             .prepare_multi_partition_for_split(multi_partition_id)
             .await
     }
-    // M3.5.* TODO: commit_multi_partition_split — Cat E with nested
-    // tuple Vecs. Needs its own MetaCommand variant. Falls through.
     async fn commit_multi_partition_split(
         &self,
         multi_partition_id: u64,
@@ -657,17 +655,26 @@ impl MetaStore for RaftMetaStore {
         new_partition_rows: Vec<u64>,
         initial_split: bool,
     ) -> Result<(), CubeError> {
-        self.store
-            .commit_multi_partition_split(
+        // M3.7: route through Raft. Old/new_partitions are flex-blobs
+        // because they nest IdRow<Partition>/IdRow<Chunk> from the
+        // metastore module.
+        let old_partitions_blob =
+            Self::encode_blob("commit_multi_partition_split", "old_partitions", &old_partitions)?;
+        let new_partitions_blob =
+            Self::encode_blob("commit_multi_partition_split", "new_partitions", &new_partitions)?;
+        self.raft
+            .propose(MetaCommand::CommitMultiPartitionSplit {
                 multi_partition_id,
                 new_multi_partitions,
                 new_multi_partition_rows,
-                old_partitions,
-                new_partitions,
+                old_partitions_blob,
+                new_partitions_blob,
                 new_partition_rows,
                 initial_split,
-            )
-            .await
+            })
+            .await?
+            .into_unit()
+            .map_err(|e| Self::mismatch("commit_multi_partition_split", e))
     }
     async fn find_unsplit_partitions(
         &self,
@@ -729,10 +736,15 @@ impl MetaStore for RaftMetaStore {
             .into_id_row(IdRowKind::Chunk)
             .map_err(|e| Self::mismatch("create_chunk", e))
     }
-    // M3.5.* TODO: insert_chunks returns Vec<IdRow<Chunk>> — requires
-    // a new MetaCommandResult::IdRowList variant. Falls through.
     async fn insert_chunks(&self, chunks: Vec<Chunk>) -> Result<Vec<IdRow<Chunk>>, CubeError> {
-        self.store.insert_chunks(chunks).await
+        // M3.7: ship pre-built chunks. Caller (cubestore internals)
+        // builds them on the leader; we serialize the whole list.
+        let chunks_blob = Self::encode_blob("insert_chunks", "chunks", &chunks)?;
+        self.raft
+            .propose(MetaCommand::InsertChunks { chunks_blob })
+            .await?
+            .into_id_row_list(IdRowKind::Chunk)
+            .map_err(|e| Self::mismatch("insert_chunks", e))
     }
     async fn get_chunk(&self, chunk_id: u64) -> Result<IdRow<Chunk>, CubeError> {
         self.store.get_chunk(chunk_id).await
@@ -785,16 +797,21 @@ impl MetaStore for RaftMetaStore {
             .into_id_row(IdRowKind::Chunk)
             .map_err(|e| Self::mismatch("chunk_uploaded", e))
     }
-    // M3.5.* TODO: chunk_update_last_inserted — needs a MetaCommand
-    // variant carrying Option<DateTime<Utc>> as Option<i64>.
     async fn chunk_update_last_inserted(
         &self,
         chunk_ids: Vec<u64>,
         last_inserted_at: Option<DateTime<Utc>>,
     ) -> Result<(), CubeError> {
-        self.store
-            .chunk_update_last_inserted(chunk_ids, last_inserted_at)
-            .await
+        // M3.7: ship the timestamp as ms-since-epoch.
+        let last_inserted_at_millis = last_inserted_at.map(|d| d.timestamp_millis());
+        self.raft
+            .propose(MetaCommand::ChunkUpdateLastInserted {
+                chunk_ids,
+                last_inserted_at_millis,
+            })
+            .await?
+            .into_unit()
+            .map_err(|e| Self::mismatch("chunk_update_last_inserted", e))
     }
     async fn deactivate_chunk(&self, chunk_id: u64) -> Result<(), CubeError> {
         // M3.4.c: leader-stamped now for `Chunk::deactivated_at`.
@@ -1024,10 +1041,14 @@ impl MetaStore for RaftMetaStore {
             .into_id_row(IdRowKind::Job)
             .map_err(|e| Self::mismatch("update_heart_beat", e))
     }
-    // M3.5.* TODO: delete_all_jobs returns Vec<IdRow<Job>> — needs
-    // a new MetaCommandResult::IdRowList variant.
     async fn delete_all_jobs(&self) -> Result<Vec<IdRow<Job>>, CubeError> {
-        self.store.delete_all_jobs().await
+        // M3.7: route through Raft, return all deleted jobs as
+        // an IdRowList.
+        self.raft
+            .propose(MetaCommand::DeleteAllJobs)
+            .await?
+            .into_id_row_list(IdRowKind::Job)
+            .map_err(|e| Self::mismatch("delete_all_jobs", e))
     }
 
     // -------------------------------------------------------------------

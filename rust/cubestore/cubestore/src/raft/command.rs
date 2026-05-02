@@ -400,6 +400,36 @@ pub enum MetaCommand {
         replay_handle_id: Option<u64>,
     },
 
+    // ---- M3.7: previously-unrouted writes ------------------------------
+    /// `insert_chunks(Vec<Chunk>)` — ships a fully-built Chunks list.
+    /// Determinism: chunks are built on the leader before propose
+    /// (same pattern as CreateChunk M3.4.a).
+    InsertChunks {
+        /// flex-encoded `Vec<Chunk>`.
+        chunks_blob: Vec<u8>,
+    },
+    /// `delete_all_jobs()` — deletes every job and returns them.
+    DeleteAllJobs,
+    /// `chunk_update_last_inserted(chunk_ids, last_inserted_at)` —
+    /// trait method that takes `Option<DateTime<Utc>>`. The leader
+    /// resolves the time and ships ms-since-epoch.
+    ChunkUpdateLastInserted {
+        chunk_ids: Vec<u64>,
+        last_inserted_at_millis: Option<i64>,
+    },
+    /// `commit_multi_partition_split` — Cat E compound atomic.
+    CommitMultiPartitionSplit {
+        multi_partition_id: u64,
+        new_multi_partitions: Vec<u64>,
+        new_multi_partition_rows: Vec<u64>,
+        /// flex-encoded `Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)>`.
+        old_partitions_blob: Vec<u8>,
+        /// flex-encoded `Vec<(IdRow<Partition>, u64)>`.
+        new_partitions_blob: Vec<u8>,
+        new_partition_rows: Vec<u64>,
+        initial_split: bool,
+    },
+
     // ---- Cat F: replay handle merge (M3.3.b.2) --------------------------
     /// `replace_replay_handles(old_ids, new_seq_pointer) -> Option<IdRow<ReplayHandle>>`.
     ReplaceReplayHandles {
@@ -496,6 +526,13 @@ pub enum MetaCommandResult {
         /// from "the call produced an unrelated variant".
         payload: Option<Vec<u8>>,
     },
+    /// Vec<IdRow<T>> — one tag, N flex-encoded payloads. Used by
+    /// writes that return many rows (e.g. `insert_chunks`,
+    /// `delete_all_jobs`). M3.7.
+    IdRowList {
+        kind: IdRowKind,
+        payloads: Vec<Vec<u8>>,
+    },
 }
 
 impl MetaCommandResult {
@@ -589,6 +626,38 @@ impl MetaCommandResult {
             Self::Bool(_) => "Bool",
             Self::IdRow { .. } => "IdRow",
             Self::OptionalIdRow { .. } => "OptionalIdRow",
+            Self::IdRowList { .. } => "IdRowList",
+        }
+    }
+
+    /// Build an `IdRowList` result from a slice of serializable rows.
+    /// M3.7.
+    pub fn id_row_list<T: serde::Serialize>(
+        kind: IdRowKind,
+        rows: &[T],
+    ) -> Result<Self, MetaCommandCodecError> {
+        let payloads = rows
+            .iter()
+            .map(|r| encode_flex(r))
+            .collect::<Result<Vec<Vec<u8>>, _>>()?;
+        Ok(Self::IdRowList { kind, payloads })
+    }
+
+    /// Decode the payloads as a typed `Vec<T>`. Errors if the result
+    /// is not an `IdRowList` of the expected `kind`. M3.7.
+    pub fn into_id_row_list<T: DeserializeOwned>(
+        self,
+        expected: IdRowKind,
+    ) -> Result<Vec<T>, MetaCommandResultMismatch> {
+        match self {
+            Self::IdRowList { kind, payloads } if kind == expected => payloads
+                .into_iter()
+                .map(|bytes| decode_flex::<T>(&bytes).map_err(MetaCommandResultMismatch::Codec))
+                .collect(),
+            other => Err(MetaCommandResultMismatch::Variant {
+                expected: format!("IdRowList({:?})", expected),
+                got: other.variant_name().to_string(),
+            }),
         }
     }
 }
@@ -992,6 +1061,86 @@ mod tests {
             uploaded_chunk_ids: vec![],
             replay_handle_id: None,
         });
+    }
+
+    #[test]
+    fn m37_unrouted_writes_round_trip() {
+        // M3.7: writes that were previously delegating to local store.
+        round_trip(MetaCommand::InsertChunks {
+            chunks_blob: vec![0xCC; 256],
+        });
+        round_trip(MetaCommand::InsertChunks { chunks_blob: vec![] });
+
+        round_trip(MetaCommand::DeleteAllJobs);
+
+        round_trip(MetaCommand::ChunkUpdateLastInserted {
+            chunk_ids: vec![1, 2, 3],
+            last_inserted_at_millis: Some(1_700_000_000_000),
+        });
+        round_trip(MetaCommand::ChunkUpdateLastInserted {
+            chunk_ids: vec![],
+            last_inserted_at_millis: None,
+        });
+
+        round_trip(MetaCommand::CommitMultiPartitionSplit {
+            multi_partition_id: 42,
+            new_multi_partitions: vec![43, 44],
+            new_multi_partition_rows: vec![100, 200],
+            old_partitions_blob: vec![0xAA; 64],
+            new_partitions_blob: vec![0xBB; 32],
+            new_partition_rows: vec![10, 20],
+            initial_split: true,
+        });
+        round_trip(MetaCommand::CommitMultiPartitionSplit {
+            multi_partition_id: 0,
+            new_multi_partitions: vec![],
+            new_multi_partition_rows: vec![],
+            old_partitions_blob: vec![],
+            new_partitions_blob: vec![],
+            new_partition_rows: vec![],
+            initial_split: false,
+        });
+    }
+
+    #[test]
+    fn meta_command_result_id_row_list_round_trip() {
+        // Build, round-trip, decode — three rows.
+        let rows = vec![
+            (1u64, "a".to_string()),
+            (2u64, "b".to_string()),
+            (3u64, "c".to_string()),
+        ];
+        let r = MetaCommandResult::id_row_list(IdRowKind::Job, &rows).expect("build");
+        result_round_trip(r.clone());
+
+        let decoded: Vec<(u64, String)> = r
+            .into_id_row_list(IdRowKind::Job)
+            .expect("decode IdRowList");
+        assert_eq!(decoded, rows);
+
+        // Empty list.
+        let empty: Vec<(u64, String)> = vec![];
+        let r = MetaCommandResult::id_row_list(IdRowKind::Job, &empty).expect("build empty");
+        result_round_trip(r.clone());
+        let decoded: Vec<(u64, String)> = r.into_id_row_list(IdRowKind::Job).expect("decode");
+        assert_eq!(decoded, empty);
+    }
+
+    #[test]
+    fn meta_command_result_id_row_list_kind_mismatch_errors() {
+        let rows = vec![(1u64, "a".to_string())];
+        let r = MetaCommandResult::id_row_list(IdRowKind::Job, &rows).expect("build");
+        let err = r
+            .into_id_row_list::<(u64, String)>(IdRowKind::Schema)
+            .unwrap_err();
+        match err {
+            MetaCommandResultMismatch::Variant { expected, got } => {
+                assert!(expected.contains("IdRowList"));
+                assert!(expected.contains("Schema"));
+                assert!(got.contains("IdRowList"));
+            }
+            other => panic!("expected Variant mismatch, got {:?}", other),
+        }
     }
 
     #[test]
