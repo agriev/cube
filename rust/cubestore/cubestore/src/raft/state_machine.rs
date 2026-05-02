@@ -164,6 +164,21 @@ async fn run_node<A: Apply>(
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Single-node bootstrap: trigger an immediate election so proposals
+    // don't race against the default `election_tick` countdown. Without
+    // this, the first 500ms of node life is "follower waiting for leader"
+    // and any proposal in that window returns ProposalDropped. Failures
+    // observed in practice on ARM64/Docker. Multi-node mode (M4) keeps
+    // the standard election timer because a self-campaign would interfere
+    // with peer-driven elections.
+    if let Err(e) = raw.campaign() {
+        // Not fatal — node will still elect via timer fallback. Log only.
+        log::warn!("raft: initial campaign() failed (will fall back to timer): {:?}", e);
+    }
+    // Drain the Ready that campaign() generates so the node actually
+    // transitions to leader state before we start accepting proposals.
+    drive_ready(&mut raw, &apply, &mut pending);
+
     loop {
         tokio::select! {
             _ = tick.tick() => {

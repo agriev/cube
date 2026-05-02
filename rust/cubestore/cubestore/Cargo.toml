@@ -118,6 +118,9 @@ prost = "0.13.1"
 # slog / slog-stdlog bridge raft-rs's logger to env_logger / simple_logger.
 # ---------------------------------------------------------------------------
 raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
+# rust-protobuf 2.x is what raft-rs's protobuf-codec generates against.
+# Pinned to the same major to use the same `protobuf::Message` trait.
+protobuf = "2"
 slog = "2.7"
 slog-stdlog = "4.1"
 slog-scope = "4.4"
