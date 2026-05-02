@@ -1309,8 +1309,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn job_lifecycle_via_metastore_trait() {
         use crate::metastore::job::{Job, JobType};
-        use crate::metastore::rocks_store::RowKey;
-        use crate::metastore::TableId;
+        // RowKey is re-exported via `pub use rocks_store::*` at the
+        // metastore root, but `rocks_store` itself is `mod` (private).
+        use crate::metastore::{RowKey, TableId};
 
         let (wrapper, sp, rp, _raft_dir) = setup_wrapper("raft_meta_store_job_lifecycle");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
