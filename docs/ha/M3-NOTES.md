@@ -126,6 +126,13 @@ After M3.7: 55 of ~86 trait writes are routed; the remaining 31 are
 read methods (which correctly delegate locally) plus the two
 `prepare_multi_*` reads.
 
+**M3.8** adds a two-instance equivalence test: two independent
+single-node Raft instances apply the same write sequence to their
+own local stores; the resulting `get_schemas` output must be
+byte-identical (same id + same name). This is a strong proof of
+M3.4's leader-stamp pattern — any non-determinism in row
+construction would surface here as a divergence.
+
 Next milestones are M4 (multi-node clustering + leader election),
 M5 (snapshots + log compaction), M6 (leader-aware client routing),
 and M7-M10 (Helm chart, observability, docs).

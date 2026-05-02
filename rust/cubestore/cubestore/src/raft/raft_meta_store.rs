@@ -23,23 +23,14 @@
 //! flex-encoded into blob fields on the `MetaCommand` variant; the
 //! dispatch in `RocksMetaStoreApply` decodes them back.
 //!
-//! ## What's in M3.5.b (this commit)
+//! ## Coverage (post-M3.7)
 //!
 //! Full `impl MetaStore for RaftMetaStore` — all 121 trait methods.
-//! Reads delegate, writes route through Raft when a `MetaCommand`
-//! variant exists, and the small set of writes without a variant
-//! delegate to the local store with a `// M3.5.* TODO` annotation
-//! that grep-finds at M3.5.c-completion time. Writes that fall
-//! through the TODO path are **not** replicated — the production
-//! gate `CUBESTORE_HA_MODE` (M3.5.c) must stay closed until those
-//! holes are closed.
-//!
-//! Variants without a current MetaCommand (delegated locally for
-//! now): `chunk_update_last_inserted`, `deactivate_chunk`,
-//! `deactivate_chunks`, `insert_chunks`, `delete_all_jobs`,
-//! `commit_multi_partition_split`, `prepare_multi_partition_for_split`,
-//! `prepare_multi_split_finish`. M3.5.b.1+ will fold these in as
-//! they're needed by passing tests.
+//! Reads delegate to the local store; **every write that mutates
+//! persistent metastore state routes through Raft.** The two
+//! `prepare_multi_partition_for_split` and `prepare_multi_split_finish`
+//! methods stay on local delegation despite their names — both
+//! use `read_operation` internally and are read-only.
 //!
 //! ## Determinism caveat (still unfixed)
 //!
@@ -634,9 +625,10 @@ impl MetaStore for RaftMetaStore {
             .into_id_row(IdRowKind::MultiPartition)
             .map_err(|e| Self::mismatch("create_multi_partition", e))
     }
-    // M3.5.* TODO: prepare_multi_partition_for_split is read+write hybrid;
-    // requires careful design to split the read piece from the write
-    // piece before HA mode can use it. Falls through locally for now.
+    // M3.7 audit: actually a `read_operation` despite the name —
+    // returns existing rows without mutating state. Local delegation
+    // is correct under HA mode (linearizable with the leader's
+    // writes since reads are leader-local in v1).
     async fn prepare_multi_partition_for_split(
         &self,
         multi_partition_id: u64,
@@ -682,7 +674,8 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Vec<u64>, CubeError> {
         self.store.find_unsplit_partitions(multi_partition_id).await
     }
-    // M3.5.* TODO: prepare_multi_split_finish — read+write hybrid.
+    // M3.7 audit: also `read_operation`; same reasoning as
+    // `prepare_multi_partition_for_split` above.
     async fn prepare_multi_split_finish(
         &self,
         multi_partition_id: u64,
