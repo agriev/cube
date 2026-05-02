@@ -97,7 +97,64 @@ jobs:
 
       - name: cargo test raft module (no networking, deterministic)
         working-directory: rust/cubestore
-        run: cargo test --package cubestore --lib raft::command::tests --release --no-fail-fast
+        run: |
+          cargo test --package cubestore --lib raft::command::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::storage::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::state_machine::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::rocks_apply::tests --release --no-fail-fast
+          cargo test --package cubestore --lib raft::raft_meta_store::tests --release --no-fail-fast
+          cargo test --package cubestore --lib config::ha_mode_tests --release --no-fail-fast
+
+  # M3.6 — run a subset of cubestore-sql-tests under
+  # `CUBESTORE_HA_MODE=raft` to verify the wrapper + dispatch works
+  # end-to-end against the real SQL surface. Single-process tests
+  # only — multi-process / cluster tests need M4 (multi-node Raft)
+  # before they make sense.
+  sql-tests-ha:
+    name: cubestore-sql-tests (HA mode, in_process)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: cubestore-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/cubestore/target
+          key: ${{ runner.os }}-cubestore-${{ hashFiles('rust/cubestore/**/Cargo.lock', 'rust/cubestore/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cubestore-
+
+      - name: Install Linux build prereqs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential pkg-config \
+            libssl-dev libsasl2-dev libpq-dev liblz4-dev libzstd-dev \
+            clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-01
+          components: rustfmt,clippy
+
+      - name: cargo test cubestore-sql-tests in_process under HA mode
+        working-directory: rust/cubestore
+        env:
+          CUBESTORE_HA_MODE: raft
+          CUBESTORE_NODE_ID: 1
+          RUST_LOG: warn,cubestore=info
+        # Use `--no-fail-fast` so the log shows every failing test,
+        # not just the first — that gives the M3.6.x backlog at a
+        # glance. The job still goes red if anything fails.
+        run: |
+          cargo test --package cubestore-sql-tests --release \
+            --test in_process --no-fail-fast
 
   # Helm chart + container image are validated in the consumer repo
   # (agriev/cube-stack-deployment), no need to duplicate here.

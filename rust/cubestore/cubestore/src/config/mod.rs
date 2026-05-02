@@ -1859,9 +1859,18 @@ impl Config {
                 max_joined_partitions: 5,
                 max_joined_partitions_message: "Please consider reducing right hand side join partition count and dataset size.".to_string(),
 
-                // HA fork — tests run with HA off by default.
-                ha_mode: HaMode::Off,
-                ha_node_id: 0,
+                // HA fork — tests run with HA off by default. When
+                // M3.6 needs to exercise the SQL test suite under
+                // HA mode, set `CUBESTORE_HA_MODE=raft` in the test
+                // process's env: `CUBESTORE_HA_MODE=raft cargo test`.
+                ha_mode: env::var("CUBESTORE_HA_MODE")
+                    .ok()
+                    .as_deref()
+                    .map(HaMode::parse)
+                    .transpose()
+                    .expect("CUBESTORE_HA_MODE: invalid value")
+                    .unwrap_or(HaMode::Off),
+                ha_node_id: env_parse("CUBESTORE_NODE_ID", 1u64),
                 ha_raft_log_dir: Self::test_data_dir_path(directory, name).join("raft-log"),
             }
         }
