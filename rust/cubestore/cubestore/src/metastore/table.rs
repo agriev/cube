@@ -200,6 +200,12 @@ impl TablePath {
 }
 
 impl Table {
+    /// Build a `Table` with `created_at` taken from `Utc::now()`.
+    /// This is the historic constructor; non-HA callers and trait
+    /// impls keep using it. Under `CUBESTORE_HA_MODE=raft`, the apply
+    /// path on each replica must build the same `Table` byte-for-
+    /// byte — the leader resolves `now` once and passes it through
+    /// [`Self::new_pure`]. See `docs/ha/M3-NOTES.md` (M3.4.b).
     pub fn new(
         table_name: String,
         schema_id: u64,
@@ -218,6 +224,50 @@ impl Table {
         partition_split_threshold: Option<u64>,
         extension: Option<String>,
     ) -> Table {
+        Self::new_pure(
+            table_name,
+            schema_id,
+            columns,
+            locations,
+            import_format,
+            is_ready,
+            build_range_end,
+            seal_at,
+            select_statement,
+            source_columns,
+            stream_offset,
+            unique_key_column_indices,
+            aggregate_column_indices,
+            seq_column_index,
+            partition_split_threshold,
+            extension,
+            Utc::now(),
+        )
+    }
+
+    /// Pure constructor — `created_at` is supplied by the caller so
+    /// the HA apply path on every replica produces a byte-identical
+    /// row. See `Chunk::new_pure` for the canonical example of the
+    /// pattern.
+    pub fn new_pure(
+        table_name: String,
+        schema_id: u64,
+        columns: Vec<Column>,
+        locations: Option<Vec<String>>,
+        import_format: Option<ImportFormat>,
+        is_ready: bool,
+        build_range_end: Option<DateTime<Utc>>,
+        seal_at: Option<DateTime<Utc>>,
+        select_statement: Option<String>,
+        source_columns: Option<Vec<Column>>,
+        stream_offset: Option<StreamOffset>,
+        unique_key_column_indices: Option<Vec<u64>>,
+        aggregate_column_indices: Vec<AggregateColumnIndex>,
+        seq_column_index: Option<u64>,
+        partition_split_threshold: Option<u64>,
+        extension: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Table {
         let location_download_sizes = locations.as_ref().map(|locations| vec![0; locations.len()]);
         Table {
             table_name,
@@ -227,7 +277,7 @@ impl Table {
             import_format,
             has_data: false,
             is_ready,
-            created_at: Some(Utc::now()),
+            created_at: Some(now),
             build_range_end,
             seal_at,
             select_statement,

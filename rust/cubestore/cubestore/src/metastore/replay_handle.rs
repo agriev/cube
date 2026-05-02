@@ -114,9 +114,20 @@ impl ReplayHandle {
         table_id: u64,
         seq_pointers_by_location: Option<Vec<Option<SeqPointer>>>,
     ) -> Self {
+        Self::new_from_seq_pointers_pure(table_id, seq_pointers_by_location, Utc::now())
+    }
+
+    /// Pure constructor — `created_at` supplied by the caller so the
+    /// HA apply path produces a byte-identical row on every replica.
+    /// See `Chunk::new_pure` for the canonical example.
+    pub fn new_from_seq_pointers_pure(
+        table_id: u64,
+        seq_pointers_by_location: Option<Vec<Option<SeqPointer>>>,
+        now: DateTime<Utc>,
+    ) -> Self {
         Self {
             table_id,
-            created_at: Utc::now(),
+            created_at: now,
             has_failed_to_persist_chunks: false,
             seq_pointers_by_location,
         }
@@ -126,6 +137,16 @@ impl ReplayHandle {
         table: &IdRow<Table>,
         location_index: usize,
         seq_pointer: SeqPointer,
+    ) -> Result<Self, CubeError> {
+        Self::new_pure(table, location_index, seq_pointer, Utc::now())
+    }
+
+    /// Pure constructor — `created_at` supplied by the caller. M3.4.b.
+    pub fn new_pure(
+        table: &IdRow<Table>,
+        location_index: usize,
+        seq_pointer: SeqPointer,
+        now: DateTime<Utc>,
     ) -> Result<Self, CubeError> {
         let mut seq_pointers_by_location = vec![
             None;
@@ -141,7 +162,7 @@ impl ReplayHandle {
         seq_pointers_by_location[location_index] = Some(seq_pointer);
         Ok(Self {
             table_id: table.get_id(),
-            created_at: Utc::now(),
+            created_at: now,
             has_failed_to_persist_chunks: false,
             seq_pointers_by_location: Some(seq_pointers_by_location),
         })
