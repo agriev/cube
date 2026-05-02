@@ -504,11 +504,30 @@ impl Apply for RocksMetaStoreApply {
                 wrap_id_row(IdRowKind::Table, &row)
             }
 
-            // ---- Deferred to M3.3.b/c -------------------------------------
-            MetaCommand::SwapActivePartitions { .. } => Err(not_yet_implemented(
-                "SwapActivePartitions",
-                "Cat E compound atomic swap with Row payloads; M3.3.b.4",
-            )),
+            // ---- SwapActivePartitions structured form (M3.3.b.4) ----------
+            MetaCommand::SwapActivePartitions {
+                current_active_blob,
+                new_active_blob,
+                new_active_min_max_blob,
+            } => {
+                use crate::metastore::{Chunk, IdRow};
+                use crate::table::Row;
+                let current_active: Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)> =
+                    decode_typed_blob(&current_active_blob, "current_active_blob")?;
+                let new_active: Vec<(IdRow<Partition>, u64)> =
+                    decode_typed_blob(&new_active_blob, "new_active_blob")?;
+                let new_active_min_max: Vec<(
+                    u64,
+                    (Option<Row>, Option<Row>),
+                    (Option<Row>, Option<Row>),
+                )> = decode_typed_blob(&new_active_min_max_blob, "new_active_min_max_blob")?;
+                self.store
+                    .swap_active_partitions(current_active, new_active, new_active_min_max)
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+
+            // ---- Still deferred -------------------------------------------
             MetaCommand::AcquirePartitionedLock { .. } => Err(not_yet_implemented(
                 "AcquirePartitionedLock",
                 "cluster-side lock op, no MetaStore equivalent yet",
@@ -732,16 +751,17 @@ mod tests {
         let (store, sp, rp) = setup_store(test_name);
         let apply = RocksMetaStoreApply::new(store.clone());
 
-        // SwapActivePartitions is still deferred (Cat E with Row payloads).
+        // AcquirePartitionedLock has no trait equivalent yet — still
+        // deferred, must error rather than silently succeed.
         let err = apply
-            .apply(MetaCommand::SwapActivePartitions {
+            .apply(MetaCommand::AcquirePartitionedLock {
                 payload_version: 1,
                 payload: vec![1, 2, 3],
             })
             .await
-            .expect_err("SwapActivePartitions must error until M3.3.b.4");
+            .expect_err("AcquirePartitionedLock must still error");
         assert!(
-            err.message.contains("SwapActivePartitions"),
+            err.message.contains("AcquirePartitionedLock"),
             "error must name the variant: {}",
             err.message
         );

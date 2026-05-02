@@ -178,11 +178,19 @@ pub enum MetaCommand {
         new_chunk: u64,
         new_chunk_file_size: u64,
     },
-    /// The repartition swap — most complex single replicated operation.
-    /// M3 will replace `payload` with structured arguments.
+    /// The repartition swap — Cat E compound atomic mutation. Three
+    /// nested-typed Vecs carrying `IdRow<Partition>`, `IdRow<Chunk>`
+    /// and `Row` data. All ride as flex blobs because their typed
+    /// shapes live in the metastore module which the raft module
+    /// deliberately doesn't import.
     SwapActivePartitions {
-        payload_version: u16,
-        payload: Vec<u8>,
+        /// flex-encoded `Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)>`.
+        current_active_blob: Vec<u8>,
+        /// flex-encoded `Vec<(IdRow<Partition>, u64)>`.
+        new_active_blob: Vec<u8>,
+        /// flex-encoded
+        /// `Vec<(u64, (Option<Row>, Option<Row>), (Option<Row>, Option<Row>))>`.
+        new_active_min_max_blob: Vec<u8>,
     },
 
     // ---- Cat A: single-id deletes (M3.1) --------------------------------
@@ -741,9 +749,19 @@ mod tests {
 
     #[test]
     fn swap_active_partitions_round_trip() {
+        // Loaded form — three populated blobs.
         round_trip(MetaCommand::SwapActivePartitions {
-            payload_version: 1,
-            payload: vec![0xBB; 1024],
+            current_active_blob: vec![0xBB; 1024],
+            new_active_blob: vec![0xCC; 64],
+            new_active_min_max_blob: vec![0xDD; 256],
+        });
+        // Empty-swap edge — codec must round-trip even when all
+        // three blobs are zero-length (a no-op swap, semantically
+        // dubious but not codec-illegal).
+        round_trip(MetaCommand::SwapActivePartitions {
+            current_active_blob: vec![],
+            new_active_blob: vec![],
+            new_active_min_max_blob: vec![],
         });
     }
 

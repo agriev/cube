@@ -88,8 +88,8 @@ heartbeat / time-based ones.
 | ↳ M3.3.a | Async Apply trait + dispatch for M3.1/M3.2 variants (~28) | ✅ done (`m3.3.a-complete`) | 1 |
 | ↳ M3.3.b.1 | Cat C — create-with-struct (8 variants) | ✅ done (`m3.3.b.1-complete`) | 1 |
 | ↳ M3.3.b.2 | Cat E + F + remaining Cat A/B (13 variants) | ✅ done (`m3.3.b.2-complete`) | 1 |
-| ↳ M3.3.b.3 | Cat D — `CreateTable` structured form | in progress | 1 |
-| ↳ M3.3.b.4 | `SwapActivePartitions` structured form (Cat E with Row payload) | pending | 1 |
+| ↳ M3.3.b.3 | Cat D — `CreateTable` structured form | ✅ done (`m3.3.b.3-complete`) | 1 |
+| ↳ M3.3.b.4 | `SwapActivePartitions` structured form (Cat E with Row payload) | in progress | 1 |
 | ↳ M3.3.c | `Batch` atomicity via shared `write_operation` | pending | 1 |
 | **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
 | **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
