@@ -35,7 +35,8 @@
 
 use flexbuffers::{DeserializationError, FlexbufferSerializer, Reader, ReaderError};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+// `Serialize` from `serde` is the trait (used in helper bounds via fully
+// qualified `serde::Serialize`); the names below are the derive macros.
 use serde_derive::{Deserialize, Serialize};
 use std::fmt;
 
@@ -213,7 +214,7 @@ impl MetaCommand {
     }
 }
 
-fn encode_flex<T: Serialize>(value: &T) -> Result<Vec<u8>, MetaCommandCodecError> {
+fn encode_flex<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MetaCommandCodecError> {
     let mut s = FlexbufferSerializer::new();
     value.serialize(&mut s)?;
     Ok(s.take_buffer())
