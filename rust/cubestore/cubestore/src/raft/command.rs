@@ -418,7 +418,8 @@ pub struct MetaCommandEnvelope {
 /// metastore depends on the raft module for replication, and the raft
 /// module would then transitively depend on metastore). Instead we ship
 /// the row as a flexbuffer-encoded blob plus this tag; the wrapper-style
-/// `RaftMetaStore: MetaStore` impl decodes it into the right `IdRow<T>`.
+/// `RaftMetaStore: MetaStore` impl (in `raft_meta_store.rs`) decodes
+/// it into the right `IdRow<T>`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IdRowKind {
     Schema,
@@ -444,7 +445,8 @@ pub enum IdRowKind {
 /// - `IdRow<T>` → `IdRow { kind, payload }`
 /// - `Option<IdRow<T>>` → `OptionalIdRow { kind, payload }`
 ///
-/// The wrapper impl on `RaftMetaStore` reads the matching variant
+/// The wrapper impl on `RaftMetaStore` (in `raft_meta_store.rs`)
+/// reads the matching variant
 /// after `propose(...).await?` and decodes the payload via flexbuffers.
 /// Variant mismatch is a **bug** — it indicates a write method is
 /// returning a result shape that doesn't match its declared trait

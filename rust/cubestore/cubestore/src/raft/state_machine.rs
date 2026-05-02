@@ -1,13 +1,8 @@
-//! `RaftMetaStore` — the wrapper-style `MetaStore` impl that routes every
-//! write through a Raft log before applying to the local state machine.
-//!
-//! ## Status
-//!
-//! M2.3 (in progress) — single-node Raft now uses the RocksDB-backed
-//! `RaftStorage` from `storage.rs`, replacing the in-memory MemStorage
-//! used in M2.1. The Raft log + HardState + ConfState all survive
-//! restart. M3 wires every concrete `MetaStore` write method through
-//! the apply path.
+//! `RaftNode` — the Raft consensus engine + apply task. Exposes
+//! [`RaftNode::propose`] for writes and ticks the Raft state machine
+//! in a tokio background task. The production `MetaStore` wrapper
+//! lives in `raft_meta_store.rs` and uses this `RaftNode` to route
+//! every write through Raft.
 //!
 //! ## Architecture
 //!
@@ -28,11 +23,10 @@
 //!
 //! ## What `Apply` is for
 //!
-//! M2 uses a test impl of `Apply` (`HashMapApply` in tests) so the
-//! round-trip is provable without touching `RocksMetaStore`. M3 will
-//! provide a `RocksMetaStoreApply` impl that dispatches each
-//! `MetaCommand` variant to the matching `RocksMetaStore::*` write
-//! method inside a single RocksDB `WriteBatch`.
+//! Tests use `RecordingApply`, `HashMapApply`, `TypedReturnApply`.
+//! Production wires a `RocksMetaStoreApply` (see `rocks_apply.rs`),
+//! which dispatches each `MetaCommand` variant to the matching
+//! `RocksMetaStore::*` write method.
 
 use crate::raft::command::{MetaCommand, MetaCommandCodecError, MetaCommandResult};
 use crate::raft::storage::{RaftStorage, RaftStorageError, SharedRaftStorage};
@@ -69,7 +63,7 @@ use tokio::sync::{mpsc, oneshot};
 /// - `IdRow<T>` returns           → `MetaCommandResult::IdRow`
 /// - `Option<IdRow<T>>` returns   → `MetaCommandResult::OptionalIdRow`
 ///
-/// The wrapper-style `RaftMetaStore: MetaStore` impl reads the
+/// The wrapper-style `RaftNode: MetaStore` impl reads the
 /// matching variant after `propose(...).await?` and decodes the
 /// payload back into the trait's typed return.
 #[async_trait]
@@ -121,11 +115,11 @@ struct Proposal {
 
 /// Handle exposed to the rest of cubestore — clones cheaply, thread-safe.
 #[derive(Clone)]
-pub struct RaftMetaStore {
+pub struct RaftNode {
     proposals: mpsc::UnboundedSender<Proposal>,
 }
 
-impl RaftMetaStore {
+impl RaftNode {
     /// Boot a single-node Raft group with persistent RocksDB storage.
     ///
     /// `data_dir` is the directory where the Raft log + HardState +
@@ -394,7 +388,7 @@ mod tests {
     async fn single_node_propose_apply_round_trip() {
         let dir = TempDir::new().unwrap();
         let apply = Arc::new(RecordingApply::new());
-        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
+        let store = RaftNode::start_single_node(dir.path(), 1, Arc::clone(&apply))
             .expect("boot single-node raft");
 
         // Even with campaign() at startup, give the apply loop a tick
@@ -445,7 +439,7 @@ mod tests {
     async fn typed_results_propagate_back_to_caller() {
         use crate::raft::command::IdRowKind;
         let dir = TempDir::new().unwrap();
-        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::new(TypedReturnApply))
+        let store = RaftNode::start_single_node(dir.path(), 1, Arc::new(TypedReturnApply))
             .expect("boot single-node raft");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -491,7 +485,7 @@ mod tests {
         // `IdRow` — must error cleanly (this is the diagnostic for a
         // misimplemented Apply variant in M3.3).
         let dir = TempDir::new().unwrap();
-        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::new(TypedReturnApply))
+        let store = RaftNode::start_single_node(dir.path(), 1, Arc::new(TypedReturnApply))
             .expect("boot single-node raft");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -514,7 +508,7 @@ mod tests {
     async fn many_proposals_serialized_in_order() {
         let dir = TempDir::new().unwrap();
         let apply = Arc::new(RecordingApply::new());
-        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
+        let store = RaftNode::start_single_node(dir.path(), 1, Arc::clone(&apply))
             .expect("boot single-node raft");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -543,7 +537,7 @@ mod tests {
     async fn batch_command_applies_atomically() {
         let dir = TempDir::new().unwrap();
         let apply = Arc::new(RecordingApply::new());
-        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
+        let store = RaftNode::start_single_node(dir.path(), 1, Arc::clone(&apply))
             .expect("boot single-node raft");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -616,7 +610,7 @@ mod tests {
         async fn run() -> Vec<(String, bool)> {
             let dir = TempDir::new().unwrap();
             let apply = Arc::new(HashMapApply::new());
-            let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
+            let store = RaftNode::start_single_node(dir.path(), 1, Arc::clone(&apply))
                 .expect("boot single-node raft");
             tokio::time::sleep(Duration::from_millis(200)).await;
             for s in &["a", "b", "c", "d"] {
@@ -657,7 +651,7 @@ mod tests {
         // Phase 1: boot, propose, shut down.
         {
             let apply = Arc::new(RecordingApply::new());
-            let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
+            let store = RaftNode::start_single_node(dir.path(), 1, Arc::clone(&apply))
                 .expect("boot raft phase 1");
             tokio::time::sleep(Duration::from_millis(200)).await;
             for i in 0..3 {
@@ -673,7 +667,7 @@ mod tests {
         }
 
         // Phase 2: reopen storage directly and verify the log is
-        // persistent. (We don't reboot the full RaftMetaStore here
+        // persistent. (We don't reboot the full RaftNode here
         // because campaign() on restart in single-node would re-elect
         // and re-emit committed entries — a separate behavior tested
         // by storage::tests.)
@@ -720,7 +714,7 @@ mod tests {
         )
         .expect("RocksMetaStore::new");
         let apply = Arc::new(RocksMetaStoreApply::new(rocks.clone()));
-        let raft = RaftMetaStore::start_single_node(raft_dir.path(), 1, apply)
+        let raft = RaftNode::start_single_node(raft_dir.path(), 1, apply)
             .expect("boot single-node raft");
 
         // Settle election.

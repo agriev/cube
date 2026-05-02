@@ -9,8 +9,10 @@
 //! - [`command`] — `MetaCommand` enum: every replicable write of the
 //!   `MetaStore` trait, serializable via the chart's existing
 //!   `flexbuffers` / `serde_bytes` codec.
-//! - [`state_machine`] — `RaftMetaStore`, the trait impl that wraps
-//!   `RocksMetaStore` and routes writes through Raft.
+//! - [`state_machine`] — `RaftNode`, the Raft consensus engine + apply
+//!   task. Wraps `raft-rs`'s `RawNode` in an mpsc/oneshot propose API.
+//! - [`raft_meta_store`] — `RaftMetaStore`, the production
+//!   `MetaStore` wrapper that uses `RaftNode` to replicate writes.
 //! - [`storage`] — `RaftStorage`, the `raft::Storage` impl backed by a
 //!   dedicated RocksDB instance under `<data_dir>/raft-log/`.
 //! - [`rocks_apply`] — `RocksMetaStoreApply`, the `Apply` impl that
@@ -32,9 +34,11 @@
 //! - [ ] M4 — Multi-node clustering + leader election
 
 pub mod command;
+pub mod raft_meta_store;
 pub mod rocks_apply;
 pub mod state_machine;
 pub mod storage;
 pub mod transport;
 
 pub use command::{MetaCommand, MetaCommandCodecError};
+pub use raft_meta_store::RaftMetaStore;

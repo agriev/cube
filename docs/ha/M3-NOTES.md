@@ -89,8 +89,12 @@ heartbeat / time-based ones.
 | ↳ M3.3.b.1 | Cat C — create-with-struct (8 variants) | ✅ done (`m3.3.b.1-complete`) | 1 |
 | ↳ M3.3.b.2 | Cat E + F + remaining Cat A/B (13 variants) | ✅ done (`m3.3.b.2-complete`) | 1 |
 | ↳ M3.3.b.3 | Cat D — `CreateTable` structured form | ✅ done (`m3.3.b.3-complete`) | 1 |
-| ↳ M3.3.b.4 | `SwapActivePartitions` structured form (Cat E with Row payload) | in progress | 1 |
+| ↳ M3.3.b.4 | `SwapActivePartitions` structured form (Cat E with Row payload) | ✅ done (`m3.3.b.4-complete`) | 1 |
 | ↳ M3.3.c | `Batch` atomicity via shared `write_operation` | pending | 1 |
+| **M3.5** | `RaftMetaStore` wrapper + `CUBESTORE_HA_MODE` boot path swap | in progress | 3 |
+| ↳ M3.5.a | Wrapper skeleton (rename `RaftMetaStore`→`RaftNode`, add `RaftMetaStore` struct + propose/decode helpers + e2e schema-lifecycle test) | in progress | 1 |
+| ↳ M3.5.b | Full `impl MetaStore for RaftMetaStore` (~121 methods) | pending | 1 |
+| ↳ M3.5.c | `CUBESTORE_HA_MODE` env var + DI binding swap | pending | 1 |
 | **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
 | **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
 | **M3.6** | cubestore-sql-tests passing with HA mode (the critical-path gate) | pending | 1-3 fixing edge cases |
