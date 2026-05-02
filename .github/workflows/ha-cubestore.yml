@@ -139,13 +139,21 @@ jobs:
           toolchain: nightly-2025-08-01
           components: rustfmt,clippy
 
-      - name: Install macOS build prereqs (protobuf)
-        # `raft-proto` (transitive from raft-rs) needs `protoc >= 3.1`.
-        # cmake comes with Xcode CLT but protoc doesn't, so brew it.
-        # `|| true` keeps the step idempotent across runs.
+      - name: Install macOS build prereqs (protobuf 21)
+        # `raft-proto` (transitive from raft-rs) needs `protoc >= 3.1`,
+        # but its `protobuf-build` crate at v0.14.1 has a parser that
+        # rejects the new protoc 4+ versioning (Google renumbered).
+        # Homebrew's mainline `protobuf` formula is now at v34+ which
+        # parses as "34.1.x" → rejected. Pin to `protobuf@21` (a
+        # frozen versioned formula = protoc 3.21.x) which parses
+        # correctly. The linux runner gets the same vintage by
+        # default via apt-get.
         run: |
-          brew install protobuf || true
-          which protoc
+          brew install protobuf@21 || true
+          # protobuf@21 is keg-only; export its bin dir for cargo.
+          PROTOBUF_BIN="$(brew --prefix protobuf@21)/bin"
+          echo "$PROTOBUF_BIN" >> "$GITHUB_PATH"
+          "$PROTOBUF_BIN/protoc" --version
 
       - name: cargo check (cubestore + tests)
         working-directory: rust/cubestore
