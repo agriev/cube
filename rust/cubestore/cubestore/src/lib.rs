@@ -38,6 +38,9 @@ pub mod import;
 pub mod metastore;
 pub mod mysql;
 pub mod queryplanner;
+// HA fork — Raft-based metadata replication. Off by default (CUBESTORE_HA_MODE).
+// See rust/cubestore/cubestore/src/raft/mod.rs and HA.md for design.
+pub mod raft;
 pub mod remotefs;
 pub mod scheduler;
 pub mod shared;

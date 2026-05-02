@@ -109,6 +109,19 @@ arc-swap = "1.7.1"
 object_store = "0.11.1"
 prost = "0.13.1"
 
+# ---------------------------------------------------------------------------
+# HA fork — Raft-based metadata replication. See docs/ha/README.md.
+# raft-rs is TiKV's mature Raft implementation (MIT). Pinned to 0.7 baseline
+# from the planning phase; compile compatibility with the workspace's
+# prost 0.13 will be resolved in M2 (state machine wiring) — for now the
+# default protobuf-rs codec keeps us off the prost version axis.
+# slog / slog-stdlog bridge raft-rs's logger to env_logger / simple_logger.
+# ---------------------------------------------------------------------------
+raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
+slog = "2.7"
+slog-stdlog = "4.1"
+slog-scope = "4.4"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rdkafka = { version = "0.29.0", features = ["ssl", "gssapi", "cmake-build"] }
 sasl2-sys = { version = "0.1.6", features = ["vendored"] }
