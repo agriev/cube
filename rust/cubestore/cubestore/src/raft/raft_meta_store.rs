@@ -268,6 +268,9 @@ impl MetaStore for RaftMetaStore {
             Some(v) => Some(Self::encode_blob("create_table", "stream_offset", v)?),
             None => None,
         };
+        // M3.4.b.2: stamp `now` on the leader so every replica's
+        // `Table::created_at` is identical.
+        let assigned_now_millis = Utc::now().timestamp_millis();
         self.raft
             .propose(MetaCommand::CreateTable {
                 schema_name,
@@ -288,6 +291,7 @@ impl MetaStore for RaftMetaStore {
                 trace_obj,
                 drop_if_exists,
                 extension,
+                assigned_now_millis,
             })
             .await?
             .into_id_row(IdRowKind::Table)

@@ -567,6 +567,7 @@ mod tests {
                     trace_obj: None,
                     drop_if_exists: false,
                     extension: None,
+                    assigned_now_millis: 0,
                 },
             ],
         };

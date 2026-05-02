@@ -432,7 +432,10 @@ impl Apply for RocksMetaStoreApply {
                 Ok(MetaCommandResult::Unit)
             }
 
-            // ---- Cat D: CreateTable structured form (M3.3.b.3) -------------
+            // ---- Cat D: CreateTable structured form (M3.3.b.3, refined M3.4.b.2)
+            // M3.4.b.2: read the leader-stamped `assigned_now_millis`
+            // and call `create_table_with_now` so the resulting Table's
+            // `created_at` is identical on every replica.
             MetaCommand::CreateTable {
                 schema_name,
                 table_name,
@@ -452,6 +455,7 @@ impl Apply for RocksMetaStoreApply {
                 trace_obj,
                 drop_if_exists,
                 extension,
+                assigned_now_millis,
             } => {
                 let columns: Vec<Column> = decode_typed_blob(&columns_blob, "columns_blob")?;
                 let import_format: Option<ImportFormat> = decode_optional_blob(
@@ -472,9 +476,10 @@ impl Apply for RocksMetaStoreApply {
                     "build_range_end_millis",
                 )?;
                 let seal_at = decode_optional_millis(seal_at_millis, "seal_at_millis")?;
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
                 let row = self
                     .store
-                    .create_table(
+                    .create_table_with_now(
                         schema_name,
                         table_name,
                         columns,
@@ -493,6 +498,7 @@ impl Apply for RocksMetaStoreApply {
                         trace_obj,
                         drop_if_exists,
                         extension,
+                        now,
                     )
                     .await?;
                 wrap_id_row(IdRowKind::Table, &row)

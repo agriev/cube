@@ -146,6 +146,10 @@ pub enum MetaCommand {
         trace_obj: Option<String>,
         drop_if_exists: bool,
         extension: Option<String>,
+        /// M3.4.b.2: leader-stamped `now` (ms-since-epoch) used for
+        /// the new `Table`'s `created_at`. Required field — the
+        /// dispatch errors if it's out of representable range.
+        assigned_now_millis: i64,
     },
     DropTable {
         table_id: u64,
@@ -693,6 +697,7 @@ mod tests {
             trace_obj: Some("trace-blob".into()),
             drop_if_exists: false,
             extension: Some("parquet".into()),
+            assigned_now_millis: 1_700_000_000_000,
         });
         // Minimum-arg form: every Option None, every Vec empty.
         round_trip(MetaCommand::CreateTable {
@@ -714,6 +719,7 @@ mod tests {
             trace_obj: None,
             drop_if_exists: false,
             extension: None,
+            assigned_now_millis: 0,
         });
     }
 
@@ -802,6 +808,7 @@ mod tests {
                     trace_obj: None,
                     drop_if_exists: false,
                     extension: None,
+                    assigned_now_millis: 0,
                 },
                 MetaCommand::DropTable { table_id: 1 },
             ],
@@ -1217,6 +1224,7 @@ mod tests {
             trace_obj: None,
             drop_if_exists: false,
             extension: None,
+            assigned_now_millis: 0,
         };
         let bytes = cmd.encode().unwrap();
         assert!(
