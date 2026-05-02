@@ -45,7 +45,9 @@ use crate::metastore::multi_index::MultiPartition;
 use crate::metastore::replay_handle::SeqPointer;
 use crate::metastore::source::SourceCredentials;
 use crate::metastore::table::StreamOffset;
-use crate::metastore::{Column, ImportFormat, IndexDef, MetaStore, Partition, RocksMetaStore};
+use crate::metastore::{
+    Chunk, Column, ImportFormat, IndexDef, MetaStore, Partition, RocksMetaStore,
+};
 use chrono::{DateTime, TimeZone, Utc};
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult};
 use crate::raft::state_machine::Apply;
@@ -149,31 +151,15 @@ impl Apply for RocksMetaStoreApply {
                 wrap_id_row(IdRowKind::Partition, &row)
             }
 
-            // ---- Cat C: create-with-struct (M3.3.b.1) ----------------------
-            MetaCommand::CreateChunk {
-                partition_id,
-                row_count,
-                in_memory,
-                min_blob,
-                max_blob,
-            } => {
-                let min: Option<Row> = decode_optional_blob(min_blob.as_deref(), "min_blob")?;
-                let max: Option<Row> = decode_optional_blob(max_blob.as_deref(), "max_blob")?;
-                // Trait takes `usize`; the wire form is `u64`. usize is
-                // platform-dependent; on 32-bit hosts a `u64` could
-                // overflow `usize`. We don't run cubestore on 32-bit
-                // (RocksDB / chunk row counts assume 64-bit indices),
-                // but we still bound the cast cleanly.
-                let row_count_usize = usize::try_from(row_count).map_err(|_| {
-                    CubeError::internal(format!(
-                        "CreateChunk row_count {} exceeds usize::MAX on this platform",
-                        row_count
-                    ))
-                })?;
-                let row = self
-                    .store
-                    .create_chunk(partition_id, row_count_usize, min, max, in_memory)
-                    .await?;
+            // ---- Cat C: create-with-struct (M3.3.b.1, refined M3.4.a) -----
+            // M3.4.a: CreateChunk ships a fully-built `Chunk` (blob)
+            // rather than raw args. The leader resolved
+            // `created_at`/`oldest_insert_at` (Utc::now) and `suffix`
+            // (random) before propose, so each replica inserts a
+            // byte-identical row. See `Chunk::new_pure`.
+            MetaCommand::CreateChunk { chunk_blob } => {
+                let chunk: Chunk = decode_typed_blob(&chunk_blob, "chunk_blob")?;
+                let row = self.store.insert_chunk_pre_built(chunk).await?;
                 wrap_id_row(IdRowKind::Chunk, &row)
             }
             MetaCommand::CreateWal {

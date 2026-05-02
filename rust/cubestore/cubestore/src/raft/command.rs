@@ -251,15 +251,16 @@ pub enum MetaCommand {
     // dispatch impl in `rocks_apply.rs` decodes it back into the typed
     // shape before calling the trait method. Field documents the
     // expected Rust type so the dispatch arm can be checked at review.
+    /// **Determinism note (M3.4)**: ships a fully-built `Chunk`
+    /// rather than the trait method's raw arguments. The wrapper
+    /// (`raft_meta_store.rs`) builds the chunk on the leader using
+    /// `Chunk::new_pure(now=Utc::now(), suffix=random())`, encodes
+    /// the result here, and the apply path inserts it verbatim
+    /// via `RocksMetaStore::insert_chunk_pre_built`. Replicas
+    /// therefore see byte-identical chunks.
     CreateChunk {
-        partition_id: u64,
-        /// Use `u64` not `usize` — flexbuffers + cross-platform stable.
-        row_count: u64,
-        in_memory: bool,
-        /// flex-encoded `Option<Row>` (`Row` from `crate::table`).
-        min_blob: Option<Vec<u8>>,
-        /// flex-encoded `Option<Row>`.
-        max_blob: Option<Vec<u8>>,
+        /// flex-encoded `Chunk` (from `crate::metastore::Chunk`).
+        chunk_blob: Vec<u8>,
     },
     CreateWal {
         table_id: u64,
@@ -959,20 +960,15 @@ mod tests {
         // Cat C variants — each carries a struct as a flex blob plus
         // primitive context. The codec doesn't decode the blob; we
         // just verify the byte-for-byte round-trip.
+        // M3.4.a: CreateChunk now ships a fully-built `Chunk` rather
+        // than the raw constructor args, so the leader's stamped
+        // `created_at`/`oldest_insert_at` and random `suffix` are
+        // replicated verbatim instead of regenerated on each replica.
         round_trip(MetaCommand::CreateChunk {
-            partition_id: 1,
-            row_count: 12345,
-            in_memory: true,
-            min_blob: Some(vec![0x01; 16]),
-            max_blob: None,
+            chunk_blob: vec![0xAA; 256],
         });
-        round_trip(MetaCommand::CreateChunk {
-            partition_id: u64::MAX,
-            row_count: 0,
-            in_memory: false,
-            min_blob: None,
-            max_blob: Some(vec![]),
-        });
+        // empty blob legal at the codec layer (apply rejects it).
+        round_trip(MetaCommand::CreateChunk { chunk_blob: vec![] });
 
         round_trip(MetaCommand::CreateWal {
             table_id: 7,

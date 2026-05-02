@@ -91,10 +91,15 @@ heartbeat / time-based ones.
 | ↳ M3.3.b.3 | Cat D — `CreateTable` structured form | ✅ done (`m3.3.b.3-complete`) | 1 |
 | ↳ M3.3.b.4 | `SwapActivePartitions` structured form (Cat E with Row payload) | ✅ done (`m3.3.b.4-complete`) | 1 |
 | ↳ M3.3.c | `Batch` atomicity via shared `write_operation` | pending | 1 |
-| **M3.5** | `RaftMetaStore` wrapper + `CUBESTORE_HA_MODE` boot path swap | in progress | 3 |
-| ↳ M3.5.a | Wrapper skeleton (rename `RaftMetaStore`→`RaftNode`, add `RaftMetaStore` struct + propose/decode helpers + e2e schema-lifecycle test) | in progress | 1 |
-| ↳ M3.5.b | Full `impl MetaStore for RaftMetaStore` (~121 methods) | pending | 1 |
-| ↳ M3.5.c | `CUBESTORE_HA_MODE` env var + DI binding swap | pending | 1 |
+| **M3.5** | `RaftMetaStore` wrapper + `CUBESTORE_HA_MODE` boot path swap | ✅ done (`m3.5-complete`) | 3 |
+| ↳ M3.5.a | Wrapper skeleton + e2e schema-lifecycle test | ✅ done (`m3.5.a-complete`) | 1 |
+| ↳ M3.5.b | Full `impl MetaStore for RaftMetaStore` (~121 methods) | ✅ done (`m3.5.b-complete`) | 1 |
+| ↳ M3.5.c.1 | `CUBESTORE_HA_MODE` env var + ConfigObj methods | ✅ done (`m3.5.c.1-complete`) | 1 |
+| ↳ M3.5.c.2 | DI swap: `RocksMetaStore`→`RaftMetaStore` when `ha_mode=raft` | ✅ done (`m3.5.c.2-complete`) | 1 |
+| **M3.4** | Determinism fix: leader-resolved `Utc::now`/random in row constructors | in progress | 3 |
+| ↳ M3.4.a | Pattern + `CreateChunk` (Chunk::new_pure + insert_chunk_pre_built) | in progress | 1 |
+| ↳ M3.4.b | Extend pattern to Table, ReplayHandle, Job | pending | 1 |
+| ↳ M3.4.c | In-place stamps (`Chunk::deactivate`, `update_heart_beat`, etc.) | pending | 1 |
 | **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
 | **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
 | **M3.6** | cubestore-sql-tests passing with HA mode (the critical-path gate) | pending | 1-3 fixing edge cases |
@@ -172,6 +177,47 @@ codec is verified by 6 round-trip tests in `command.rs::tests`.
 returns `MetaCommandResultMismatch` — never panics. This is the
 diagnostic for a misimplemented Apply variant in M3.3 and converts
 cleanly to `CubeError::internal` at the trait boundary.
+
+## M3.4 — leader-build pattern
+
+Audit found the determinism gap is **not** in metastore trait method
+bodies (their `Utc::now()` calls are read-only filters) but in **row
+constructors**:
+
+| Constructor                  | Non-deterministic input(s)        |
+|------------------------------|------------------------------------|
+| `Chunk::new`                 | `created_at`, `oldest_insert_at` (`Utc::now`); `suffix` (`thread_rng`) |
+| `Chunk::deactivate`          | `deactivated_at` (`Utc::now`)     |
+| `Table::new`                 | `created_at` (`Utc::now`)         |
+| `Job::new`                   | `last_heart_beat` (`Utc::now`)    |
+| `ReplayHandle::new`          | `created_at` (`Utc::now`)         |
+
+**Pattern (M3.4.a, exemplified by `Chunk`):**
+
+1. Add `RowType::new_pure(args..., now, suffix...)` — every input
+   explicit. `RowType::new` becomes a thin wrapper that calls
+   `new_pure` with `Utc::now()` and `thread_rng()`.
+2. Add inherent `RocksMetaStore::insert_<row>_pre_built(row)` —
+   takes a fully-built row and inserts. Outside HA mode it's also a
+   useful escape hatch for callers wanting explicit field control.
+3. Replace the `MetaCommand::Create<Row> { args }` variant with
+   `MetaCommand::Create<Row> { row_blob }` — ships a fully-built
+   row instead of construction args.
+4. Wrapper's `MetaStore::create_<row>(args)` builds the row on the
+   leader (which is always self when proposing), encodes, proposes.
+   Replicas decode and call `insert_<row>_pre_built`.
+
+**Result**: every replica's RocksDB content is byte-identical for the
+inserted row. Plus `next_id` is deterministic in HA mode because all
+writes go through Raft in the same order, so the merge-counter
+advances identically on every replica.
+
+**M3.4.b** lands the same pattern for Table, ReplayHandle, and Job.
+**M3.4.c** handles in-place stamps (`Chunk::deactivate`,
+`update_heart_beat`) — those are trickier because the stamp happens
+inside `write_operation` rather than in a constructor. Likely fix:
+the wrapper pre-stamps and ships through new variants
+(`DeactivateChunkAt`, `HeartBeatAt`).
 
 ## M3.3 — design decisions parked here
 

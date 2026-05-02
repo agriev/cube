@@ -712,22 +712,15 @@ impl MetaStore for RaftMetaStore {
         max: Option<Row>,
         in_memory: bool,
     ) -> Result<IdRow<Chunk>, CubeError> {
-        let min_blob = match &min {
-            Some(v) => Some(Self::encode_blob("create_chunk", "min", v)?),
-            None => None,
-        };
-        let max_blob = match &max {
-            Some(v) => Some(Self::encode_blob("create_chunk", "max", v)?),
-            None => None,
-        };
+        // M3.4.a: build the Chunk on the leader so `created_at`,
+        // `oldest_insert_at` and `suffix` are resolved once and
+        // shipped through the Raft log. Replicas then insert the
+        // pre-built chunk byte-for-byte. See `Chunk::new_pure` and
+        // `RocksMetaStore::insert_chunk_pre_built`.
+        let chunk = Chunk::new(partition_id, row_count, min, max, in_memory);
+        let chunk_blob = Self::encode_blob("create_chunk", "chunk", &chunk)?;
         self.raft
-            .propose(MetaCommand::CreateChunk {
-                partition_id,
-                row_count: row_count as u64,
-                in_memory,
-                min_blob,
-                max_blob,
-            })
+            .propose(MetaCommand::CreateChunk { chunk_blob })
             .await?
             .into_id_row(IdRowKind::Chunk)
             .map_err(|e| Self::mismatch("create_chunk", e))

@@ -12,12 +12,48 @@ use serde::{Deserialize, Deserializer};
 use std::io::Cursor;
 
 impl Chunk {
+    /// Build a chunk with the wall clock and suffix taken from the
+    /// host (`Utc::now()` and a random suffix from `thread_rng`).
+    /// This is the historic constructor; non-HA callers and trait
+    /// impls keep using it. Under `CUBESTORE_HA_MODE=raft` the
+    /// wrapper instead uses [`Self::new_pure`] so the leader
+    /// resolves both values once and replicates them — see
+    /// `docs/ha/M3-NOTES.md` (M3.4 determinism gate).
     pub fn new(
         partition_id: u64,
         row_count: usize,
         min: Option<Row>,
         max: Option<Row>,
         in_memory: bool,
+    ) -> Chunk {
+        let suffix = String::from_utf8(thread_rng().sample_iter(&Alphanumeric).take(8).collect())
+            .unwrap()
+            .to_lowercase();
+        Self::new_pure(
+            partition_id,
+            row_count,
+            min,
+            max,
+            in_memory,
+            Utc::now(),
+            suffix,
+        )
+    }
+
+    /// Pure constructor — every non-deterministic input is supplied
+    /// by the caller. The HA wrapper resolves `now` and `suffix` on
+    /// the leader and ships them through the Raft log so every
+    /// replica builds an identical `Chunk`. Outside HA mode the
+    /// constructor is also useful for tests and explicit-time code
+    /// paths.
+    pub fn new_pure(
+        partition_id: u64,
+        row_count: usize,
+        min: Option<Row>,
+        max: Option<Row>,
+        in_memory: bool,
+        now: DateTime<Utc>,
+        suffix: String,
     ) -> Chunk {
         Chunk {
             partition_id,
@@ -26,14 +62,10 @@ impl Chunk {
             active: false,
             last_used: None,
             in_memory,
-            created_at: Some(Utc::now()),
-            oldest_insert_at: Some(Utc::now()),
+            created_at: Some(now),
+            oldest_insert_at: Some(now),
             deactivated_at: None,
-            suffix: Some(
-                String::from_utf8(thread_rng().sample_iter(&Alphanumeric).take(8).collect())
-                    .unwrap()
-                    .to_lowercase(),
-            ),
+            suffix: Some(suffix),
             file_size: None,
             replay_handle_id: None,
             min,

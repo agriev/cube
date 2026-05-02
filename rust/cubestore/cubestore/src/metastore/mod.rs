@@ -1659,6 +1659,25 @@ impl RocksMetaStore {
 }
 
 impl RocksMetaStore {
+    /// Insert a pre-built `Chunk` and return its `IdRow`. Used by the
+    /// HA fork's apply path (`raft::rocks_apply`) when the leader has
+    /// already resolved every non-deterministic input on a `Chunk`
+    /// (created_at, oldest_insert_at, suffix) — replicas just persist
+    /// the pre-built chunk verbatim. See `docs/ha/M3-NOTES.md` (M3.4).
+    ///
+    /// Outside HA mode this is also a convenient escape hatch for
+    /// callers that want explicit control over `Chunk` fields.
+    pub async fn insert_chunk_pre_built(
+        &self,
+        chunk: Chunk,
+    ) -> Result<IdRow<Chunk>, CubeError> {
+        self.write_operation("insert_chunk_pre_built", move |db_ref, batch_pipe| {
+            let rocks_chunk = ChunkRocksTable::new(db_ref);
+            Ok(rocks_chunk.insert(chunk, batch_pipe)?)
+        })
+        .await
+    }
+
     fn add_index(
         batch_pipe: &mut BatchPipe<'_, RocksMetaStore>,
         rocks_index: &IndexRocksTable,
