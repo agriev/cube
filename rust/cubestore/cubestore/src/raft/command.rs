@@ -354,6 +354,9 @@ pub enum MetaCommand {
     StartProcessingJob {
         server_name: String,
         long_term: bool,
+        /// M3.4.d: leader-stamped `now` for the new
+        /// `last_heart_beat` on the picked job.
+        assigned_now_millis: i64,
     },
     UpdateStatus {
         job_id: u64,
@@ -923,10 +926,12 @@ mod tests {
         round_trip(MetaCommand::StartProcessingJob {
             server_name: "node1".into(),
             long_term: true,
+            assigned_now_millis: 1_700_000_000_000,
         });
         round_trip(MetaCommand::StartProcessingJob {
             server_name: String::new(),
             long_term: false,
+            assigned_now_millis: 0,
         });
         round_trip(MetaCommand::UpdateStatus {
             job_id: 42,

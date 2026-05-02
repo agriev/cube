@@ -392,10 +392,12 @@ impl Apply for RocksMetaStoreApply {
             MetaCommand::StartProcessingJob {
                 server_name,
                 long_term,
+                assigned_now_millis,
             } => {
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
                 let opt = self
                     .store
-                    .start_processing_job(server_name, long_term)
+                    .start_processing_job_with_now(server_name, long_term, now)
                     .await?;
                 MetaCommandResult::optional_id_row(IdRowKind::Job, opt.as_ref()).map_err(|e| {
                     CubeError::internal(format!("encode StartProcessingJob result: {}", e))

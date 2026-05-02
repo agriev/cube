@@ -1795,6 +1795,44 @@ impl RocksMetaStore {
         .await
     }
 
+    /// HA-determinism: `start_processing_job` with leader-stamped now.
+    /// M3.4.d.
+    pub async fn start_processing_job_with_now(
+        &self,
+        server_name: String,
+        long_term: bool,
+        now: DateTime<Utc>,
+    ) -> Result<Option<IdRow<Job>>, CubeError> {
+        self.write_operation("start_processing_job", move |db_ref, batch_pipe| {
+            let table = JobRocksTable::new(db_ref);
+            let next_job = table
+                .get_rows_by_index(
+                    &JobIndexKey::ScheduledByShard(Some(server_name.to_string())),
+                    &JobRocksIndex::ByShard,
+                )?
+                .into_iter()
+                .filter(|j| j.get_row().is_long_term() == long_term)
+                .min_by(|a, b| b.get_row().priority().cmp(&a.get_row().priority()));
+
+            if let Some(job) = next_job {
+                if let JobStatus::ProcessingBy(node) = job.get_row().status() {
+                    return Err(CubeError::internal(format!(
+                        "Job {:?} is already processing by {}",
+                        job, node
+                    )));
+                }
+                Ok(Some(table.update_with_fn(
+                    job.get_id(),
+                    move |row| row.start_processing_pure(server_name.clone(), now),
+                    batch_pipe,
+                )?))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
     /// HA-determinism variant of `create_table` — takes an explicit
     /// `now` for the new row's `created_at`. The trait method
     /// `MetaStore::create_table` delegates here with `Utc::now()`,
@@ -4381,36 +4419,9 @@ impl MetaStore for RocksMetaStore {
         server_name: String,
         long_term: bool,
     ) -> Result<Option<IdRow<Job>>, CubeError> {
-        self.write_operation("start_processing_job", move |db_ref, batch_pipe| {
-            let table = JobRocksTable::new(db_ref);
-            let next_job = table
-                .get_rows_by_index(
-                    &JobIndexKey::ScheduledByShard(Some(server_name.to_string())),
-                    &JobRocksIndex::ByShard,
-                )?
-                .into_iter()
-                .filter(|j| j.get_row().is_long_term() == long_term)
-                //We use min_by instead of the max_by because of min_by returns the first element
-                //if priority is equal while max_by returns the last element
-                .min_by(|a, b| b.get_row().priority().cmp(&a.get_row().priority()));
-
-            if let Some(job) = next_job {
-                if let JobStatus::ProcessingBy(node) = job.get_row().status() {
-                    return Err(CubeError::internal(format!(
-                        "Job {:?} is already processing by {}",
-                        job, node
-                    )));
-                }
-                Ok(Some(table.update_with_fn(
-                    job.get_id(),
-                    |row| row.start_processing(server_name),
-                    batch_pipe,
-                )?))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
+        // M3.4.d: delegate so HA mode can use the leader-stamped now.
+        self.start_processing_job_with_now(server_name, long_term, Utc::now())
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

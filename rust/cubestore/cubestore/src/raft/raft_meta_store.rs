@@ -981,10 +981,14 @@ impl MetaStore for RaftMetaStore {
         server_name: String,
         long_term: bool,
     ) -> Result<Option<IdRow<Job>>, CubeError> {
+        // M3.4.d: leader-stamped now for the picked job's
+        // `last_heart_beat`.
+        let assigned_now_millis = Utc::now().timestamp_millis();
         self.raft
             .propose(MetaCommand::StartProcessingJob {
                 server_name,
                 long_term,
+                assigned_now_millis,
             })
             .await?
             .into_optional_id_row(IdRowKind::Job)
