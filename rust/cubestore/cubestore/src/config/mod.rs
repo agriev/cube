@@ -562,6 +562,55 @@ pub trait ConfigObj: DIService {
     fn max_joined_partitions(&self) -> usize;
 
     fn max_joined_partitions_message(&self) -> &str;
+
+    // ----------------------------------------------------------------
+    // HA fork — Raft-based metadata replication. See `docs/ha/`.
+    // M3.5.c.1 lands the env binding only; M3.5.c.2 wires the DI swap
+    // in `configure_meta_store` so a `RaftMetaStore` is constructed
+    // when `ha_mode() == HaMode::Raft`.
+    // ----------------------------------------------------------------
+    fn ha_mode(&self) -> HaMode;
+
+    /// Stable u64 node id within the Raft group. Required when
+    /// `ha_mode() == Raft`. In Kubernetes the natural source is the
+    /// StatefulSet ordinal — `cubestore-router-0` → 1, etc.
+    fn ha_node_id(&self) -> u64;
+
+    /// Directory where the Raft log + HardState + ConfState live.
+    /// Default: `<data_dir>/raft-log/`. Must be on persistent storage
+    /// (the same PVC as the metastore RocksDB).
+    fn ha_raft_log_dir(&self) -> PathBuf;
+}
+
+/// The HA fork's top-level switch. Default is `Off` — drop-in
+/// compatible with upstream cubestore. `Raft` activates the
+/// `RaftMetaStore` wrapper (M3.5.c.2), routing every metastore write
+/// through Raft consensus before applying.
+///
+/// **Do not flip to `Raft` until M3.4 has landed**, otherwise the
+/// non-deterministic `Utc::now()` calls in row constructors
+/// (`Table::new`, `Chunk::new`, `Job::new`, `ReplayHandle::new`)
+/// will diverge across replicas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HaMode {
+    /// Default; drop-in compatible with upstream cubestore.
+    #[default]
+    Off,
+    /// Raft-replicated metastore (the HA fork's reason for existing).
+    Raft,
+}
+
+impl HaMode {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" | "" => Ok(Self::Off),
+            "raft" => Ok(Self::Raft),
+            other => Err(format!(
+                "CUBESTORE_HA_MODE: expected one of [off, raft], got {:?}",
+                other
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -670,6 +719,11 @@ pub struct ConfigObjImpl {
     pub compaction_readiness_chunks_threshold: Option<u64>,
     pub max_joined_partitions: usize,
     pub max_joined_partitions_message: String,
+
+    // HA fork (M3.5.c.1).
+    pub ha_mode: HaMode,
+    pub ha_node_id: u64,
+    pub ha_raft_log_dir: PathBuf,
 }
 
 crate::di_service!(ConfigObjImpl, [ConfigObj]);
@@ -1076,6 +1130,21 @@ impl ConfigObj for ConfigObjImpl {
     fn cachestore_cache_eviction_proactive_size_threshold(&self) -> u32 {
         self.cachestore_cache_eviction_proactive_size_threshold
     }
+
+    // ----------------------------------------------------------------
+    // HA fork (M3.5.c.1).
+    // ----------------------------------------------------------------
+    fn ha_mode(&self) -> HaMode {
+        self.ha_mode
+    }
+
+    fn ha_node_id(&self) -> u64 {
+        self.ha_node_id
+    }
+
+    fn ha_raft_log_dir(&self) -> PathBuf {
+        self.ha_raft_log_dir.clone()
+    }
 }
 
 lazy_static! {
@@ -1270,13 +1339,26 @@ impl Config {
             Some(256 << 20),
         ) as u64;
 
+        // M3.5.c.1: bind data_dir to a local first so the HA raft-log
+        // directory can default to `<data_dir>/raft-log/`.
+        let data_dir: PathBuf = env::var("CUBESTORE_DATA_DIR")
+            .ok()
+            .map(|v| PathBuf::from(v))
+            .unwrap_or(env::current_dir().unwrap().join(".cubestore").join("data"));
+        let ha_mode = match env::var("CUBESTORE_HA_MODE") {
+            Ok(s) => HaMode::parse(&s).expect("CUBESTORE_HA_MODE: invalid value"),
+            Err(_) => HaMode::Off,
+        };
+        let ha_node_id = env_parse("CUBESTORE_NODE_ID", 0u64);
+        let ha_raft_log_dir = env::var("CUBESTORE_HA_RAFT_LOG_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("raft-log"));
+
         let result = Config {
             injector: Injector::new(),
             config_obj: Arc::new(ConfigObjImpl {
-                data_dir: env::var("CUBESTORE_DATA_DIR")
-                    .ok()
-                    .map(|v| PathBuf::from(v))
-                    .unwrap_or(env::current_dir().unwrap().join(".cubestore").join("data")),
+                data_dir: data_dir.clone(),
                 dump_dir: env::var("CUBESTORE_DUMP_DIR")
                     .ok()
                     .map(|v| PathBuf::from(v)),
@@ -1619,6 +1701,11 @@ impl Config {
                 ),
                 max_joined_partitions: env_parse("CUBESTORE_MAX_JOINED_PARTITIONS", 5),
                 max_joined_partitions_message: "Please consider reducing right hand side join partition count and dataset size.".to_string(),
+
+                // HA fork (M3.5.c.1) — DI swap to RaftMetaStore is M3.5.c.2.
+                ha_mode,
+                ha_node_id,
+                ha_raft_log_dir,
             }),
         };
         result.validate_config();
@@ -1771,6 +1858,11 @@ impl Config {
                 compaction_readiness_chunks_threshold: None,
                 max_joined_partitions: 5,
                 max_joined_partitions_message: "Please consider reducing right hand side join partition count and dataset size.".to_string(),
+
+                // HA fork — tests run with HA off by default.
+                ha_mode: HaMode::Off,
+                ha_node_id: 0,
+                ha_raft_log_dir: Self::test_data_dir_path(directory, name).join("raft-log"),
             }
         }
     }
@@ -2577,4 +2669,41 @@ pub async fn uses_remote_metastore(i: &Injector) -> bool {
 
 pub fn is_router(c: &dyn ConfigObj) -> bool {
     !c.worker_bind_address().is_some()
+}
+
+#[cfg(test)]
+mod ha_mode_tests {
+    use super::HaMode;
+
+    #[test]
+    fn parses_canonical_strings() {
+        assert_eq!(HaMode::parse("off").unwrap(), HaMode::Off);
+        assert_eq!(HaMode::parse("raft").unwrap(), HaMode::Raft);
+    }
+
+    #[test]
+    fn parse_is_case_insensitive() {
+        assert_eq!(HaMode::parse("OFF").unwrap(), HaMode::Off);
+        assert_eq!(HaMode::parse("Raft").unwrap(), HaMode::Raft);
+        assert_eq!(HaMode::parse("RAFT").unwrap(), HaMode::Raft);
+    }
+
+    #[test]
+    fn empty_string_is_off() {
+        // An empty `CUBESTORE_HA_MODE=""` set in a Helm chart `env` block
+        // accidentally is the same as "not set" — both should be Off.
+        assert_eq!(HaMode::parse("").unwrap(), HaMode::Off);
+    }
+
+    #[test]
+    fn unknown_values_are_rejected() {
+        let err = HaMode::parse("on").unwrap_err();
+        assert!(err.contains("CUBESTORE_HA_MODE"));
+        assert!(err.contains("on"));
+    }
+
+    #[test]
+    fn default_is_off() {
+        assert_eq!(HaMode::default(), HaMode::Off);
+    }
 }
