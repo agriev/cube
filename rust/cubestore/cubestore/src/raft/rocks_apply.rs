@@ -566,15 +566,36 @@ impl Apply for RocksMetaStoreApply {
                 "cluster-side lock op, no MetaStore equivalent yet",
             )),
 
-            // ---- Batch -----------------------------------------------------
-            // M3.3.c will route this through one `write_operation` so the
-            // sequence applies as a single RocksDB WriteBatch. Until then,
-            // accept-and-degrade-to-non-atomic would be a determinism bug,
-            // so reject.
-            MetaCommand::Batch { .. } => Err(not_yet_implemented(
-                "Batch",
-                "M3.3.c — needs single write_operation with sub-dispatch",
-            )),
+            // ---- Batch (M3.3.c) --------------------------------------------
+            // Apply each sub-command in order. Determinism is preserved
+            // because every replica sees the same Raft entry and walks
+            // the same loop in the same order.
+            //
+            // **Atomicity caveat (M3.3.c)**: each sub-command runs as
+            // its own `write_operation`, so an N-statement batch is
+            // N independent RocksDB WriteBatches, not one atomic one.
+            // If a mid-batch sub-command errors, the prefix has
+            // already committed. M3.3.c.atomic is the follow-up that
+            // routes the whole batch through a single
+            // `write_operation` with a shared `BatchPipe` — that
+            // requires sync `_in_batch_pipe` helpers per variant
+            // (mirroring the existing `drop_table_impl`).
+            //
+            // Nested Batch is rejected — flatten on the wrapper if
+            // you need a flat sequence.
+            MetaCommand::Batch { commands } => {
+                for cmd in commands {
+                    if let MetaCommand::Batch { .. } = cmd {
+                        return Err(CubeError::internal(
+                            "MetaCommand::Batch nested inside Batch is rejected — \
+                             flatten on the wrapper before propose"
+                                .into(),
+                        ));
+                    }
+                    Box::pin(self.apply(cmd)).await?;
+                }
+                Ok(MetaCommandResult::Unit)
+            }
 
             // ---- Generic escape hatch -------------------------------------
             // M1→M3 transition tool; once every method has a typed variant
@@ -807,14 +828,18 @@ mod tests {
             err.message
         );
 
-        // Batch is M3.3.c — must error.
+        // Nested Batch is rejected — M3.3.c flattens before propose.
         let err = apply
             .apply(MetaCommand::Batch {
-                commands: vec![MetaCommand::DeleteWal { wal_id: 1 }],
+                commands: vec![MetaCommand::Batch { commands: vec![] }],
             })
             .await
-            .expect_err("Batch must error in M3.3.a");
-        assert!(err.message.contains("Batch"));
+            .expect_err("nested Batch must error");
+        assert!(
+            err.message.contains("nested inside Batch"),
+            "error must explain nested-batch rejection: {}",
+            err.message
+        );
 
         // Generic always errors at apply (it's a transition escape hatch).
         let err = apply
@@ -825,6 +850,45 @@ mod tests {
             .await
             .expect_err("Generic must error");
         assert!(err.message.contains("totally_made_up"));
+
+        cleanup(&sp, &rp);
+    }
+
+    #[tokio::test]
+    async fn batch_applies_each_command_in_order() {
+        let test_name = "raft_apply_batch";
+        let (store, sp, rp) = setup_store(test_name);
+        let apply = RocksMetaStoreApply::new(store.clone());
+
+        // Apply a Batch that creates two schemas in order.
+        let r = apply
+            .apply(MetaCommand::Batch {
+                commands: vec![
+                    MetaCommand::CreateSchema {
+                        schema_name: "first".into(),
+                        if_not_exists: false,
+                    },
+                    MetaCommand::CreateSchema {
+                        schema_name: "second".into(),
+                        if_not_exists: false,
+                    },
+                ],
+            })
+            .await
+            .expect("apply Batch");
+        r.into_unit().expect("Batch result is Unit");
+
+        // Both schemas must be present in insertion order.
+        let listed = store.get_schemas().await.expect("get_schemas");
+        let names: Vec<String> = listed
+            .into_iter()
+            .map(|r| r.get_row().get_name().clone())
+            .collect();
+        assert!(
+            names.contains(&"first".to_string()) && names.contains(&"second".to_string()),
+            "Batch must apply both creates: {:?}",
+            names
+        );
 
         cleanup(&sp, &rp);
     }

@@ -102,7 +102,8 @@ heartbeat / time-based ones.
 | ↳ M3.4.b.1 | Plumb leader-stamped now through ReplayHandle apply paths | ✅ done (`m3.4.b.1-complete`) | 1 |
 | ↳ M3.4.b.2 | Same for `create_table` (extract create_table_with_now) | ✅ done (`m3.4.b.2-complete`) | 1 |
 | ↳ M3.4.c | In-place stamps (`Chunk::deactivate`, `update_heart_beat`, `update_status`, plus DeactivateChunk{s} variants) | ✅ done (`m3.4.c-complete`) | 1 |
-| ↳ M3.4.d | `start_processing_job` leader-stamp | in progress | 1 |
+| ↳ M3.4.d | `start_processing_job` leader-stamp | ✅ done (`m3.4.d-complete`) | 1 |
+| ↳ M3.3.c | Serial Batch dispatch (non-atomic; documented caveat) | in progress | 1 |
 | **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
 | **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
 | **M3.6** | cubestore-sql-tests passing with HA mode (the critical-path gate) | pending | 1-3 fixing edge cases |
