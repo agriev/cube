@@ -3,45 +3,50 @@
 //!
 //! ## Status
 //!
-//! M2.1 (in progress) — single-node Raft with in-memory log + a pluggable
-//! `Apply` trait. This is the foundation; M2.2 swaps `MemStorage` for a
-//! RocksDB-backed `RaftStorage` (see `storage.rs`), and M3 wires every
-//! concrete `MetaStore` write method through the apply path.
+//! M2.3 (in progress) — single-node Raft now uses the RocksDB-backed
+//! `RaftStorage` from `storage.rs`, replacing the in-memory MemStorage
+//! used in M2.1. The Raft log + HardState + ConfState all survive
+//! restart. M3 wires every concrete `MetaStore` write method through
+//! the apply path.
 //!
 //! ## Architecture
 //!
 //! One Tokio task owns the `RawNode`. Clients propose by sending a
 //! `MetaCommand` plus a oneshot reply channel through an mpsc; the
 //! Raft task ticks on a fixed interval, drains its `Ready` after every
-//! tick (appending entries, applying committed ones, sending messages
-//! to peers), and resolves each oneshot when its corresponding entry
-//! has been applied.
+//! tick (appending entries to the persistent log, applying committed
+//! ones, sending messages to peers), and resolves each oneshot when
+//! its corresponding entry has been applied.
 //!
 //! Single-node specifics: there are no peers, so `step(message)` is
 //! never called. As soon as an entry is appended on the leader (which
 //! is always self in a 1-node cluster) it commits on the next tick and
-//! becomes ready to apply.
+//! becomes ready to apply. The task calls `RawNode::campaign()` once
+//! at boot to skip the default election timeout — without that, the
+//! first ~500ms of node life is "follower waiting for leader" and any
+//! proposal in that window returns ProposalDropped.
 //!
 //! ## What `Apply` is for
 //!
-//! In M2.1 we use a test impl of `Apply` (`HashMapApply`) so the round-
-//! trip is provable without touching `RocksMetaStore`. M3 will provide
-//! a `RocksMetaStoreApply` impl that dispatches each `MetaCommand`
-//! variant to the matching `RocksMetaStore::*` write method inside a
-//! single RocksDB `WriteBatch`.
+//! M2 uses a test impl of `Apply` (`HashMapApply` in tests) so the
+//! round-trip is provable without touching `RocksMetaStore`. M3 will
+//! provide a `RocksMetaStoreApply` impl that dispatches each
+//! `MetaCommand` variant to the matching `RocksMetaStore::*` write
+//! method inside a single RocksDB `WriteBatch`.
 
 use crate::raft::command::{MetaCommand, MetaCommandCodecError};
+use crate::raft::storage::{RaftStorage, RaftStorageError, SharedRaftStorage};
 use crate::CubeError;
-use raft::prelude::{ConfState, Entry, EntryType, Message};
-use raft::storage::MemStorage;
+use raft::eraftpb::{ConfState, Entry, EntryType, Message};
 use raft::{Config, RawNode};
 use slog::{o, Drain};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// A pluggable side-effect that the Raft apply loop runs for every
-/// committed `MetaCommand`. M2.1 uses a test implementation; M3 will
+/// committed `MetaCommand`. M2 uses a test implementation; M3 will
 /// provide one backed by `RocksMetaStore`.
 ///
 /// Implementations must be **deterministic** — every replica that
@@ -61,11 +66,12 @@ pub enum ApplyOutcome {
 }
 
 /// Errors specific to the Raft layer (separate from the codec errors
-/// in `command.rs`).
+/// in `command.rs` and the storage errors in `storage.rs`).
 #[derive(Debug)]
 pub enum RaftError {
     Codec(MetaCommandCodecError),
     Raft(raft::Error),
+    Storage(RaftStorageError),
     ApplyChannelClosed,
     ProposeChannelClosed,
 }
@@ -79,6 +85,12 @@ impl From<MetaCommandCodecError> for RaftError {
 impl From<raft::Error> for RaftError {
     fn from(e: raft::Error) -> Self {
         Self::Raft(e)
+    }
+}
+
+impl From<RaftStorageError> for RaftError {
+    fn from(e: RaftStorageError) -> Self {
+        Self::Storage(e)
     }
 }
 
@@ -102,14 +114,29 @@ pub struct RaftMetaStore {
 }
 
 impl RaftMetaStore {
-    /// Boot a single-node Raft group on the current Tokio runtime.
-    /// The returned handle is what the rest of the system uses for
-    /// proposals; the actual Raft work runs on a background task.
+    /// Boot a single-node Raft group with persistent RocksDB storage.
     ///
-    /// `apply` is the side-effect that the apply loop invokes for
-    /// every committed entry.
+    /// `data_dir` is the directory where the Raft log + HardState +
+    /// ConfState live (typically `<cubestore_data_dir>/raft-log/`).
+    /// On first boot the dir is created and seeded with an empty
+    /// HardState and a ConfState containing only `node_id`. On
+    /// subsequent boots the existing log is opened and the node
+    /// resumes from its last applied position.
     pub fn start_single_node<A: Apply>(
+        data_dir: impl AsRef<Path>,
         node_id: u64,
+        apply: Arc<A>,
+    ) -> Result<Self, RaftError> {
+        let storage_inner = RaftStorage::open(data_dir, vec![node_id])?;
+        let storage = SharedRaftStorage::new(Arc::new(storage_inner));
+        Self::start_with_storage(node_id, storage, apply)
+    }
+
+    /// Lower-level constructor used by tests and (future) custom
+    /// storage backends. Most callers want `start_single_node`.
+    pub fn start_with_storage<A: Apply>(
+        node_id: u64,
+        storage: SharedRaftStorage,
         apply: Arc<A>,
     ) -> Result<Self, RaftError> {
         let logger = build_drain_logger();
@@ -118,7 +145,7 @@ impl RaftMetaStore {
             id: node_id,
             election_tick: 10,
             heartbeat_tick: 3,
-            applied: 0,
+            applied: storage.applied_index_or_zero(),
             max_size_per_msg: 1024 * 1024,
             max_inflight_msgs: 256,
             check_quorum: false,
@@ -126,15 +153,12 @@ impl RaftMetaStore {
             ..Default::default()
         };
 
-        let storage = MemStorage::new_with_conf_state(ConfState::from((vec![node_id], vec![])));
-
-        let raw = RawNode::new(&cfg, storage, &logger)?;
+        let raw = RawNode::new(&cfg, storage.clone(), &logger)?;
 
         let (tx, rx) = mpsc::unbounded_channel::<Proposal>();
-        // The apply-pending map: entry_index → oneshot to fire on apply.
         let pending = std::collections::HashMap::<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>::new();
 
-        tokio::spawn(run_node(raw, rx, apply, pending, logger));
+        tokio::spawn(run_node(raw, storage, rx, apply, pending, logger));
 
         Ok(Self { proposals: tx })
     }
@@ -154,7 +178,8 @@ impl RaftMetaStore {
 }
 
 async fn run_node<A: Apply>(
-    mut raw: RawNode<MemStorage>,
+    mut raw: RawNode<SharedRaftStorage>,
+    storage: SharedRaftStorage,
     mut proposals: mpsc::UnboundedReceiver<Proposal>,
     apply: Arc<A>,
     mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>,
@@ -166,24 +191,23 @@ async fn run_node<A: Apply>(
 
     // Single-node bootstrap: trigger an immediate election so proposals
     // don't race against the default `election_tick` countdown. Without
-    // this, the first 500ms of node life is "follower waiting for leader"
-    // and any proposal in that window returns ProposalDropped. Failures
-    // observed in practice on ARM64/Docker. Multi-node mode (M4) keeps
-    // the standard election timer because a self-campaign would interfere
-    // with peer-driven elections.
+    // this, the first ~500ms of node life is "follower waiting for leader"
+    // and any proposal in that window returns ProposalDropped. Multi-node
+    // mode (M4) keeps timer-driven elections — explicit campaign on every
+    // node would interfere with peer-driven elections.
     if let Err(e) = raw.campaign() {
-        // Not fatal — node will still elect via timer fallback. Log only.
-        log::warn!("raft: initial campaign() failed (will fall back to timer): {:?}", e);
+        log::warn!(
+            "raft: initial campaign() failed (will fall back to timer): {:?}",
+            e
+        );
     }
-    // Drain the Ready that campaign() generates so the node actually
-    // transitions to leader state before we start accepting proposals.
-    drive_ready(&mut raw, &apply, &mut pending);
+    drive_ready(&mut raw, &storage, &apply, &mut pending);
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 raw.tick();
-                drive_ready(&mut raw, &apply, &mut pending);
+                drive_ready(&mut raw, &storage, &apply, &mut pending);
             }
             maybe = proposals.recv() => {
                 match maybe {
@@ -197,8 +221,6 @@ async fn run_node<A: Apply>(
                                 continue;
                             }
                         };
-                        // Stash the responder under the index that this
-                        // proposal will commit at.
                         let next_index = raw.raft.raft_log.last_index() + 1;
                         if let Err(e) = raw.propose(vec![], bytes) {
                             let _ = p.respond_to.send(Err(CubeError::internal(format!(
@@ -207,9 +229,9 @@ async fn run_node<A: Apply>(
                             continue;
                         }
                         pending.insert(next_index, p.respond_to);
-                        drive_ready(&mut raw, &apply, &mut pending);
+                        drive_ready(&mut raw, &storage, &apply, &mut pending);
                     }
-                    None => break, // sender dropped → graceful shutdown
+                    None => break,
                 }
             }
         }
@@ -217,7 +239,8 @@ async fn run_node<A: Apply>(
 }
 
 fn drive_ready<A: Apply>(
-    raw: &mut RawNode<MemStorage>,
+    raw: &mut RawNode<SharedRaftStorage>,
+    storage: &SharedRaftStorage,
     apply: &Arc<A>,
     pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>,
 ) {
@@ -226,40 +249,58 @@ fn drive_ready<A: Apply>(
     }
     let mut ready = raw.ready();
 
-    // 1. Persist log entries. (MemStorage is in-memory; M2.2 RocksDB.)
+    // 1. Persist log entries to RocksDB. fsync-before-ack is enabled
+    //    inside RaftStorage::append (correctness requirement).
     if !ready.entries().is_empty() {
-        let store = raw.store();
-        store.wl().append(ready.entries()).expect("MemStorage append");
+        if let Err(e) = storage.append(ready.entries()) {
+            // A storage failure here is fatal for Raft correctness —
+            // the leader must never ack entries it didn't durably
+            // persist. We crash-loop the task; Kubernetes will
+            // restart the pod which then re-derives state from the
+            // existing log on disk.
+            panic!("raft storage append failed: {}", e);
+        }
     }
 
     // 2. Persist HardState (term, vote, commit) if changed.
     if let Some(hs) = ready.hs() {
-        let store = raw.store();
-        store.wl().set_hardstate(hs.clone());
+        if let Err(e) = storage.set_hard_state(hs.clone()) {
+            panic!("raft storage set_hard_state failed: {}", e);
+        }
     }
 
-    // 3. Send messages — single-node has no peers, so this is a no-op.
+    // 3. Send outbound messages. Single-node has no peers — no-op.
+    //    M4 will route these through the cuberpc transport.
     let _outbound: Vec<Message> = ready.take_messages();
 
     // 4. Apply committed entries.
-    apply_committed(ready.committed_entries(), apply, pending);
+    let highest_applied = apply_committed(ready.committed_entries(), apply, pending);
+    if let Some(idx) = highest_applied {
+        let _ = storage.set_applied_index(idx); // best-effort; M5 uses for snapshots
+    }
 
     // 5. Tell raft we're done with this Ready.
     let mut light_ready = raw.advance(ready);
 
-    // light_ready may carry additional commit advancement — apply those
-    // entries too (mostly for clean idle-time tick behavior).
-    apply_committed(light_ready.committed_entries(), apply, pending);
+    let highest_applied2 = apply_committed(light_ready.committed_entries(), apply, pending);
+    if let Some(idx) = highest_applied2 {
+        let _ = storage.set_applied_index(idx);
+    }
     raw.advance_apply();
     let _ = light_ready.take_messages();
 }
 
+/// Apply each committed entry, return the highest index actually
+/// applied (caller persists this to `applied_index` for restart-time
+/// recovery).
 fn apply_committed<A: Apply>(
     entries: &[Entry],
     apply: &Arc<A>,
     pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>,
-) {
+) -> Option<u64> {
+    let mut highest = None;
     for ent in entries {
+        highest = Some(ent.index);
         if ent.data.is_empty() {
             // Empty entries are emitted on leader election — skip.
             continue;
@@ -269,7 +310,9 @@ fn apply_committed<A: Apply>(
         match ent.entry_type {
             EntryType::EntryNormal => {
                 let result = MetaCommand::decode(&ent.data)
-                    .map_err(|e| CubeError::internal(format!("decode at index {}: {}", ent.index, e)))
+                    .map_err(|e| {
+                        CubeError::internal(format!("decode at index {}: {}", ent.index, e))
+                    })
                     .and_then(|cmd| apply.apply(cmd));
                 if let Some(tx) = pending.remove(&ent.index) {
                     let _ = tx.send(result);
@@ -280,6 +323,7 @@ fn apply_committed<A: Apply>(
             }
         }
     }
+    highest
 }
 
 fn build_drain_logger() -> slog::Logger {
@@ -289,14 +333,21 @@ fn build_drain_logger() -> slog::Logger {
     slog::Logger::root(drain, o!("subsystem" => "raft"))
 }
 
+// Avoid unused-import warning when ConfState only matters in tests.
+#[allow(dead_code)]
+fn _conf_state_keepalive(cs: ConfState) -> ConfState {
+    cs
+}
+
 // =============================================================================
-// Tests — single-node propose→apply round-trip
+// Tests — single-node propose→apply round-trip with persistent storage
 // =============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     /// Test `Apply` impl that just remembers every command it was
     /// asked to apply, in order.
@@ -322,17 +373,16 @@ mod tests {
         }
     }
 
-    /// Boot a single-node raft, propose one CreateSchema, await apply,
-    /// assert the recorded command matches what was proposed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_node_propose_apply_round_trip() {
+        let dir = TempDir::new().unwrap();
         let apply = Arc::new(RecordingApply::new());
-        let store = RaftMetaStore::start_single_node(1, Arc::clone(&apply))
+        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
             .expect("boot single-node raft");
 
-        // Single-node clusters elect themselves leader on the first tick
-        // (~50ms). Give a generous warm-up before proposing.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Even with campaign() at startup, give the apply loop a tick
+        // or two to settle. 200ms is generous on a warm container.
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let cmd = MetaCommand::CreateSchema {
             schema_name: "public".into(),
@@ -349,14 +399,14 @@ mod tests {
         assert_eq!(recorded[0], cmd, "applied command must equal proposed");
     }
 
-    /// 50 proposals, all replicated, all applied in order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn many_proposals_serialized_in_order() {
+        let dir = TempDir::new().unwrap();
         let apply = Arc::new(RecordingApply::new());
-        let store = RaftMetaStore::start_single_node(1, Arc::clone(&apply))
+        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
             .expect("boot single-node raft");
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let mut proposed = Vec::with_capacity(50);
         for i in 0..50 {
@@ -370,7 +420,6 @@ mod tests {
 
         let recorded = apply.snapshot();
         assert_eq!(recorded.len(), 50);
-        // Single-node Raft preserves submission order.
         for (i, cmd) in recorded.iter().enumerate() {
             match cmd {
                 MetaCommand::DropTable { table_id } => assert_eq!(*table_id, i as u64),
@@ -379,14 +428,14 @@ mod tests {
         }
     }
 
-    /// Propose a Batch — apply must receive it intact (atomicity contract).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn batch_command_applies_atomically() {
+        let dir = TempDir::new().unwrap();
         let apply = Arc::new(RecordingApply::new());
-        let store = RaftMetaStore::start_single_node(1, Arc::clone(&apply))
+        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
             .expect("boot single-node raft");
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let batch = MetaCommand::Batch {
             commands: vec![
@@ -406,18 +455,13 @@ mod tests {
 
         let recorded = apply.snapshot();
         assert_eq!(recorded.len(), 1);
-        // The apply layer sees the Batch as one logical entry. M3 will
-        // expand it inside the apply impl when wiring to RocksMetaStore.
         assert_eq!(recorded[0], batch);
     }
 
     /// HashMap state machine — closer to what M3 will see in production.
-    /// Demonstrates that two replays of the same log produce the same
-    /// state (determinism rehearsal — see plan risk #1).
     struct HashMapApply {
-        schemas: Mutex<HashMap<String, bool /* if_not_exists */>>,
+        schemas: Mutex<HashMap<String, bool>>,
     }
-
     impl HashMapApply {
         fn new() -> Self {
             Self {
@@ -425,7 +469,6 @@ mod tests {
             }
         }
     }
-
     impl Apply for HashMapApply {
         fn apply(&self, cmd: MetaCommand) -> Result<ApplyOutcome, CubeError> {
             if let MetaCommand::CreateSchema {
@@ -445,10 +488,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deterministic_replay_produces_identical_state() {
         async fn run() -> Vec<(String, bool)> {
+            let dir = TempDir::new().unwrap();
             let apply = Arc::new(HashMapApply::new());
-            let store = RaftMetaStore::start_single_node(1, Arc::clone(&apply))
+            let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
                 .expect("boot single-node raft");
-            tokio::time::sleep(Duration::from_millis(800)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             for s in &["a", "b", "c", "d"] {
                 store
                     .propose(MetaCommand::CreateSchema {
@@ -458,14 +502,60 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let mut out: Vec<(String, bool)> =
-                apply.schemas.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect();
+            let mut out: Vec<(String, bool)> = apply
+                .schemas
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
             out.sort();
             out
         }
         let a = run().await;
         let b = run().await;
-        assert_eq!(a, b, "two independent runs of the same proposals must produce identical state");
+        assert_eq!(
+            a, b,
+            "two independent runs of the same proposals must produce identical state"
+        );
         assert_eq!(a.len(), 4);
+    }
+
+    /// Hardest test: data persists across simulated restart.
+    /// Boot raft, propose entries, drop the handle (simulating pod
+    /// kill), reopen storage, verify entries are still there in the
+    /// persistent log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entries_persist_across_node_restart() {
+        let dir = TempDir::new().unwrap();
+        // Phase 1: boot, propose, shut down.
+        {
+            let apply = Arc::new(RecordingApply::new());
+            let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::clone(&apply))
+                .expect("boot raft phase 1");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            for i in 0..3 {
+                store
+                    .propose(MetaCommand::DropTable { table_id: i })
+                    .await
+                    .expect("propose");
+            }
+            // Drop store + apply: tokio task dies when the proposals
+            // sender is dropped.
+            drop(store);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Phase 2: reopen storage directly and verify the log is
+        // persistent. (We don't reboot the full RaftMetaStore here
+        // because campaign() on restart in single-node would re-elect
+        // and re-emit committed entries — a separate behavior tested
+        // by storage::tests.)
+        let reopened = RaftStorage::open(dir.path(), vec![1]).expect("reopen");
+        assert!(
+            reopened.last_index_internal_for_test() >= 3,
+            "log should contain at least 3 proposed entries; got last_index={}",
+            reopened.last_index_internal_for_test()
+        );
     }
 }

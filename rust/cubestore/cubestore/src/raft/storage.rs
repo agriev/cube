@@ -38,7 +38,7 @@ use cuberockstore::rocksdb::{
     self, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 const CF_ENTRIES: &str = "entries";
 const CF_META: &str = "meta";
@@ -356,6 +356,91 @@ impl Storage for RaftStorage {
         // Snapshots are M5. For M2/M3/M4 we return SnapshotTemporarilyUnavailable
         // which raft-rs handles by retrying later.
         Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+    }
+}
+
+// =============================================================================
+// SharedRaftStorage — Cloneable Arc-wrapped RaftStorage so that raft-rs's
+// RawNode<S: Storage> can hold one handle while the apply loop holds another.
+//
+// raft-rs's MemStorage is itself Cloneable via internal Arc<RwLock<...>>.
+// We don't want to bake Arc into RaftStorage's struct (it complicates the
+// open/close lifecycle), so we wrap it externally.
+// =============================================================================
+
+#[derive(Clone)]
+pub struct SharedRaftStorage(Arc<RaftStorage>);
+
+impl SharedRaftStorage {
+    pub fn new(inner: Arc<RaftStorage>) -> Self {
+        Self(inner)
+    }
+
+    pub fn append(&self, entries: &[Entry]) -> Result<(), RaftStorageError> {
+        self.0.append(entries)
+    }
+
+    pub fn set_hard_state(&self, hs: HardState) -> Result<(), RaftStorageError> {
+        self.0.set_hard_state(hs)
+    }
+
+    pub fn set_conf_state(&self, cs: ConfState) -> Result<(), RaftStorageError> {
+        self.0.set_conf_state(cs)
+    }
+
+    pub fn set_applied_index(&self, idx: u64) -> Result<(), RaftStorageError> {
+        self.0.set_applied_index(idx)
+    }
+
+    pub fn applied_index(&self) -> Result<Option<u64>, RaftStorageError> {
+        self.0.applied_index()
+    }
+
+    /// Convenience: same as `applied_index().unwrap_or(0)`. Used by
+    /// the state machine boot path to seed `Config::applied`.
+    pub fn applied_index_or_zero(&self) -> u64 {
+        self.0.applied_index().ok().flatten().unwrap_or(0)
+    }
+
+    pub fn compact(&self, compact_to: u64) -> Result<(), RaftStorageError> {
+        self.0.compact(compact_to)
+    }
+}
+
+impl Storage for SharedRaftStorage {
+    fn initial_state(&self) -> raft::Result<RaftState> {
+        self.0.initial_state()
+    }
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_size: impl Into<Option<u64>>,
+        ctx: GetEntriesContext,
+    ) -> raft::Result<Vec<Entry>> {
+        self.0.entries(low, high, max_size, ctx)
+    }
+    fn term(&self, idx: u64) -> raft::Result<u64> {
+        self.0.term(idx)
+    }
+    fn first_index(&self) -> raft::Result<u64> {
+        self.0.first_index()
+    }
+    fn last_index(&self) -> raft::Result<u64> {
+        self.0.last_index()
+    }
+    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
+        self.0.snapshot(request_index, to)
+    }
+}
+
+impl RaftStorage {
+    /// Test helper used by state_machine::tests to verify log
+    /// persistence across restart without going through the public
+    /// raft::Storage trait.
+    #[cfg(test)]
+    pub fn last_index_internal_for_test(&self) -> u64 {
+        self.last_index_internal().unwrap_or(0)
     }
 }
 
