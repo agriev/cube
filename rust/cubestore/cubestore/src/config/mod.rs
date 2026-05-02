@@ -2260,30 +2260,117 @@ impl Config {
                 })
                 .await;
             let path = self.meta_store_path().to_str().unwrap().to_string();
-            self.injector
-                .register_typed_with_default::<dyn MetaStore, RocksMetaStore, _, _>(
-                    async move |i| {
-                        let config = i.get_service_typed::<dyn ConfigObj>().await;
-                        let metastore_fs = i.get_service("metastore_fs").await;
-                        let meta_store = if let Some(dump_dir) = config.clone().dump_dir() {
-                            RocksMetaStore::load_from_dump(
-                                &Path::new(&path),
-                                dump_dir,
-                                metastore_fs,
-                                config,
-                            )
-                            .await
-                            .unwrap()
-                        } else {
-                            RocksMetaStore::load_from_remote(&path, metastore_fs, config)
-                                .await
-                                .unwrap()
-                        };
-                        meta_store.add_listener(metastore_event_sender).await;
-                        meta_store
-                    },
-                )
-                .await;
+            // M3.5.c.2: branch on HA mode.
+            //
+            // - Off (default): register `RocksMetaStore` as both
+            //   the concrete service and the `dyn MetaStore` trait
+            //   binding. Drop-in compatible with upstream cubestore.
+            // - Raft: register `RocksMetaStore` as concrete only;
+            //   then register `RaftMetaStore` (which wraps the
+            //   inner `RocksMetaStore`) as `dyn MetaStore`. The
+            //   inner store is still reachable via
+            //   `cube_services().rocks_meta_store` for upload-loop
+            //   access (see line ~2633).
+            let ha_mode = self.config_obj.ha_mode();
+            let ha_node_id = self.config_obj.ha_node_id();
+            let ha_raft_log_dir = self.config_obj.ha_raft_log_dir();
+            match ha_mode {
+                HaMode::Off => {
+                    self.injector
+                        .register_typed_with_default::<dyn MetaStore, RocksMetaStore, _, _>(
+                            async move |i| {
+                                let config = i.get_service_typed::<dyn ConfigObj>().await;
+                                let metastore_fs = i.get_service("metastore_fs").await;
+                                let meta_store = if let Some(dump_dir) =
+                                    config.clone().dump_dir()
+                                {
+                                    RocksMetaStore::load_from_dump(
+                                        &Path::new(&path),
+                                        dump_dir,
+                                        metastore_fs,
+                                        config,
+                                    )
+                                    .await
+                                    .unwrap()
+                                } else {
+                                    RocksMetaStore::load_from_remote(
+                                        &path, metastore_fs, config,
+                                    )
+                                    .await
+                                    .unwrap()
+                                };
+                                meta_store.add_listener(metastore_event_sender).await;
+                                meta_store
+                            },
+                        )
+                        .await;
+                }
+                HaMode::Raft => {
+                    // ⚠ Determinism caveat (M3.4): row constructors
+                    // (`Table::new`, `Chunk::new`, `Job::new`,
+                    // `ReplayHandle::new`) stamp `Utc::now()` at
+                    // apply time. Until M3.4 lands the leader-stamp
+                    // pattern, replicas will diverge — even though
+                    // M3.5.c.2 makes HA mode reachable, it is not
+                    // production-safe. Treat `CUBESTORE_HA_MODE=raft`
+                    // as a developer toggle until M3.4 is in.
+                    log::warn!(
+                        "CUBESTORE_HA_MODE=raft enabled — see docs/ha/M3-NOTES.md \
+                         for the M3.4 determinism caveat. Do not use in production \
+                         until M3.4 has landed."
+                    );
+
+                    // Use the pre-cloned sender for the Raft arm so
+                    // the Off arm above can still consume the
+                    // original. (One match arm runs at a time at
+                    // runtime, but the compiler inspects both at
+                    // compile time and would object to a double move.)
+                    let _ = metastore_event_sender_to_move;
+                    let event_sender = metastore_event_sender;
+                    self.injector
+                        .register_typed::<RocksMetaStore, RocksMetaStore, _, _>(
+                            async move |i| {
+                                let config = i.get_service_typed::<dyn ConfigObj>().await;
+                                let metastore_fs = i.get_service("metastore_fs").await;
+                                let meta_store = if let Some(dump_dir) =
+                                    config.clone().dump_dir()
+                                {
+                                    RocksMetaStore::load_from_dump(
+                                        &Path::new(&path),
+                                        dump_dir,
+                                        metastore_fs,
+                                        config,
+                                    )
+                                    .await
+                                    .unwrap()
+                                } else {
+                                    RocksMetaStore::load_from_remote(
+                                        &path, metastore_fs, config,
+                                    )
+                                    .await
+                                    .unwrap()
+                                };
+                                meta_store.add_listener(event_sender).await;
+                                meta_store
+                            },
+                        )
+                        .await;
+
+                    self.injector
+                        .register_typed::<dyn MetaStore, crate::raft::RaftMetaStore, _, _>(
+                            async move |i| {
+                                let inner = i.get_service_typed::<RocksMetaStore>().await;
+                                crate::raft::RaftMetaStore::start_single_node(
+                                    &ha_raft_log_dir,
+                                    ha_node_id,
+                                    inner,
+                                )
+                                .expect("RaftMetaStore boot failed")
+                            },
+                        )
+                        .await;
+                }
+            }
         };
 
         self.injector
