@@ -161,6 +161,59 @@ pub enum MetaCommand {
         payload: Vec<u8>,
     },
 
+    // ---- Cat A: single-id deletes (M3.1) --------------------------------
+    DeleteSchemaById {
+        schema_id: u64,
+    },
+    DeletePartitionById {
+        partition_id: u64,
+    },
+    MarkPartitionWarmedUp {
+        partition_id: u64,
+    },
+    DeleteMiddleManPartition {
+        partition_id: u64,
+    },
+    DeleteChunk {
+        chunk_id: u64,
+    },
+    DeleteWal {
+        wal_id: u64,
+    },
+    DeleteJob {
+        job_id: u64,
+    },
+    DeleteSource {
+        id: u64,
+    },
+    DeleteReplayHandle {
+        id: u64,
+    },
+
+    // ---- Cat B: two-arg primitives (M3.1) -------------------------------
+    RenameSchemaById {
+        schema_id: u64,
+        new_schema_name: String,
+    },
+    UpdateHeartBeat {
+        job_id: u64,
+    },
+    SetCurrentSnapshot {
+        // u128 — flexbuffers doesn't have native u128, so encode as
+        // [u64; 2] (low, high). Keeps round-trip exact.
+        snapshot_id_low: u64,
+        snapshot_id_high: u64,
+    },
+    AcquirePartitionedLock {
+        // arguments TBD when we type-fully this in M3.3
+        payload_version: u16,
+        payload: Vec<u8>,
+    },
+    ReleasePartitionedLock {
+        payload_version: u16,
+        payload: Vec<u8>,
+    },
+
     // ---- Atomic batch ----------------------------------------------------
     /// Multi-statement DDL — `BatchPipe`. Applied as a single RocksDB
     /// `WriteBatch` on the apply path so the whole sequence either
@@ -357,6 +410,42 @@ mod tests {
             commands: vec![MetaCommand::Batch {
                 commands: vec![MetaCommand::DropTable { table_id: 1 }],
             }],
+        });
+    }
+
+    #[test]
+    fn cat_a_single_id_deletes_round_trip() {
+        round_trip(MetaCommand::DeleteSchemaById { schema_id: 1 });
+        round_trip(MetaCommand::DeletePartitionById { partition_id: 999 });
+        round_trip(MetaCommand::MarkPartitionWarmedUp { partition_id: 0 });
+        round_trip(MetaCommand::DeleteMiddleManPartition {
+            partition_id: u64::MAX,
+        });
+        round_trip(MetaCommand::DeleteChunk { chunk_id: 7 });
+        round_trip(MetaCommand::DeleteWal { wal_id: 42 });
+        round_trip(MetaCommand::DeleteJob { job_id: 100 });
+        round_trip(MetaCommand::DeleteSource { id: 5 });
+        round_trip(MetaCommand::DeleteReplayHandle { id: 99 });
+    }
+
+    #[test]
+    fn cat_b_two_arg_primitives_round_trip() {
+        round_trip(MetaCommand::RenameSchemaById {
+            schema_id: 1,
+            new_schema_name: "renamed".into(),
+        });
+        round_trip(MetaCommand::UpdateHeartBeat { job_id: 7 });
+        round_trip(MetaCommand::SetCurrentSnapshot {
+            snapshot_id_low: 0xDEAD_BEEF_CAFE_BABE,
+            snapshot_id_high: 0x1234_5678_9ABC_DEF0,
+        });
+        round_trip(MetaCommand::AcquirePartitionedLock {
+            payload_version: 1,
+            payload: vec![0xAA; 32],
+        });
+        round_trip(MetaCommand::ReleasePartitionedLock {
+            payload_version: 1,
+            payload: vec![],
         });
     }
 
