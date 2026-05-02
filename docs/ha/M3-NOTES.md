@@ -84,7 +84,13 @@ heartbeat / time-based ones.
 |---|---|---|---|
 | **M3.1** | Catalog + 14 new variants in MetaCommand (Cat A + B) | ✅ done (`m3.1-complete`) | 1 |
 | **M3.2** | `MetaCommandResult` enum with typed returns mirroring trait return shapes | ✅ done (`m3.2-complete`) | 1 |
-| **M3.3** | `RocksMetaStoreApply: Apply` impl — dispatch table for every variant | pending | 3-5 (incremental) |
+| **M3.3** | `RocksMetaStoreApply: Apply` impl — dispatch table for every variant | in progress | 3-5 (incremental) |
+| ↳ M3.3.a | Async Apply trait + dispatch for M3.1/M3.2 variants (~28) | ✅ done (`m3.3.a-complete`) | 1 |
+| ↳ M3.3.b.1 | Cat C — create-with-struct (8 variants) | in progress | 1 |
+| ↳ M3.3.b.2 | Cat F — jobs / sources / replay handles | pending | 1 |
+| ↳ M3.3.b.3 | Cat E — atomic chunk swaps | pending | 1 |
+| ↳ M3.3.b.4 | Cat D — `CreateTable` structured form | pending | 1 |
+| ↳ M3.3.c | `Batch` atomicity via shared `write_operation` | pending | 1 |
 | **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
 | **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
 | **M3.6** | cubestore-sql-tests passing with HA mode (the critical-path gate) | pending | 1-3 fixing edge cases |

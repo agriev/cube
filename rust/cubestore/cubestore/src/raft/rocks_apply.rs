@@ -40,9 +40,14 @@
 //! is atomic across the dispatched commands. Until then, `Batch`
 //! returns an error.
 
-use crate::metastore::{MetaStore, Partition, RocksMetaStore};
+use crate::metastore::multi_index::MultiPartition;
+use crate::metastore::replay_handle::SeqPointer;
+use crate::metastore::{
+    Column, IndexDef, MetaStore, Partition, RocksMetaStore, SourceCredentials,
+};
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult};
 use crate::raft::state_machine::Apply;
+use crate::table::Row;
 use crate::CubeError;
 use async_trait::async_trait;
 use flexbuffers::Reader;
@@ -125,12 +130,7 @@ impl Apply for RocksMetaStoreApply {
 
             // ---- Partitions ------------------------------------------------
             MetaCommand::CreatePartition { partition_blob } => {
-                let partition: Partition = decode_flex(&partition_blob).map_err(|e| {
-                    CubeError::internal(format!(
-                        "CreatePartition: blob decode failed: {}",
-                        e
-                    ))
-                })?;
+                let partition: Partition = decode_typed_blob(&partition_blob, "partition_blob")?;
                 let row = self.store.create_partition(partition).await?;
                 wrap_id_row(IdRowKind::Partition, &row)
             }
@@ -145,6 +145,119 @@ impl Apply for RocksMetaStoreApply {
             MetaCommand::DeleteMiddleManPartition { partition_id } => {
                 let row = self.store.delete_middle_man_partition(partition_id).await?;
                 wrap_id_row(IdRowKind::Partition, &row)
+            }
+
+            // ---- Cat C: create-with-struct (M3.3.b.1) ----------------------
+            MetaCommand::CreateChunk {
+                partition_id,
+                row_count,
+                in_memory,
+                min_blob,
+                max_blob,
+            } => {
+                let min: Option<Row> = decode_optional_blob(min_blob.as_deref(), "min_blob")?;
+                let max: Option<Row> = decode_optional_blob(max_blob.as_deref(), "max_blob")?;
+                // Trait takes `usize`; the wire form is `u64`. usize is
+                // platform-dependent; on 32-bit hosts a `u64` could
+                // overflow `usize`. We don't run cubestore on 32-bit
+                // (RocksDB / chunk row counts assume 64-bit indices),
+                // but we still bound the cast cleanly.
+                let row_count_usize = usize::try_from(row_count).map_err(|_| {
+                    CubeError::internal(format!(
+                        "CreateChunk row_count {} exceeds usize::MAX on this platform",
+                        row_count
+                    ))
+                })?;
+                let row = self
+                    .store
+                    .create_chunk(partition_id, row_count_usize, min, max, in_memory)
+                    .await?;
+                wrap_id_row(IdRowKind::Chunk, &row)
+            }
+            MetaCommand::CreateWal {
+                table_id,
+                row_count,
+            } => {
+                let row_count_usize = usize::try_from(row_count).map_err(|_| {
+                    CubeError::internal(format!(
+                        "CreateWal row_count {} exceeds usize::MAX on this platform",
+                        row_count
+                    ))
+                })?;
+                let row = self.store.create_wal(table_id, row_count_usize).await?;
+                wrap_id_row(IdRowKind::Wal, &row)
+            }
+            MetaCommand::CreateIndex {
+                schema_name,
+                table_name,
+                index_def_blob,
+            } => {
+                let index_def: IndexDef = decode_typed_blob(&index_def_blob, "index_def_blob")?;
+                let row = self
+                    .store
+                    .create_index(schema_name, table_name, index_def)
+                    .await?;
+                wrap_id_row(IdRowKind::Index, &row)
+            }
+            MetaCommand::CreatePartitionedIndex {
+                schema,
+                name,
+                columns_blob,
+                if_not_exists,
+            } => {
+                let columns: Vec<Column> = decode_typed_blob(&columns_blob, "columns_blob")?;
+                let row = self
+                    .store
+                    .create_partitioned_index(schema, name, columns, if_not_exists)
+                    .await?;
+                wrap_id_row(IdRowKind::MultiIndex, &row)
+            }
+            MetaCommand::CreateMultiPartition {
+                multi_partition_blob,
+            } => {
+                let mp: MultiPartition =
+                    decode_typed_blob(&multi_partition_blob, "multi_partition_blob")?;
+                let row = self.store.create_multi_partition(mp).await?;
+                wrap_id_row(IdRowKind::MultiPartition, &row)
+            }
+            MetaCommand::CreateOrUpdateSource {
+                name,
+                credentials_blob,
+            } => {
+                let creds: SourceCredentials =
+                    decode_typed_blob(&credentials_blob, "credentials_blob")?;
+                let row = self.store.create_or_update_source(name, creds).await?;
+                wrap_id_row(IdRowKind::Source, &row)
+            }
+            MetaCommand::CreateReplayHandle {
+                table_id,
+                location_index,
+                seq_pointer_blob,
+            } => {
+                let seq: SeqPointer = decode_typed_blob(&seq_pointer_blob, "seq_pointer_blob")?;
+                let location_usize = usize::try_from(location_index).map_err(|_| {
+                    CubeError::internal(format!(
+                        "CreateReplayHandle location_index {} exceeds usize::MAX",
+                        location_index
+                    ))
+                })?;
+                let row = self
+                    .store
+                    .create_replay_handle(table_id, location_usize, seq)
+                    .await?;
+                wrap_id_row(IdRowKind::ReplayHandle, &row)
+            }
+            MetaCommand::CreateReplayHandleFromSeqPointers {
+                table_id,
+                seq_pointers_blob,
+            } => {
+                let seq_pointers: Option<Vec<Option<SeqPointer>>> =
+                    decode_typed_blob(&seq_pointers_blob, "seq_pointers_blob")?;
+                let row = self
+                    .store
+                    .create_replay_handle_from_seq_pointers(table_id, seq_pointers)
+                    .await?;
+                wrap_id_row(IdRowKind::ReplayHandle, &row)
             }
 
             // ---- Chunks ----------------------------------------------------
@@ -272,6 +385,28 @@ fn wrap_id_row<T: serde::Serialize>(
 fn decode_flex<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     let r = Reader::get_root(bytes).map_err(|e| e.to_string())?;
     T::deserialize(r).map_err(|e| e.to_string())
+}
+
+/// Decode a blob field that's always present. Returns a `CubeError`
+/// already wrapped in the format `Apply` callers expect.
+fn decode_typed_blob<T: DeserializeOwned>(bytes: &[u8], field: &str) -> Result<T, CubeError> {
+    decode_flex(bytes).map_err(|e| {
+        CubeError::internal(format!(
+            "MetaCommand apply: {} decode failed: {}",
+            field, e
+        ))
+    })
+}
+
+/// Decode an `Option<...>` blob: `None` skips, `Some(bytes)` decodes.
+fn decode_optional_blob<T: DeserializeOwned>(
+    bytes: Option<&[u8]>,
+    field: &str,
+) -> Result<Option<T>, CubeError> {
+    match bytes {
+        None => Ok(None),
+        Some(b) => decode_typed_blob(b, field).map(Some),
+    }
 }
 
 fn not_yet_implemented(variant: &str, reason: &str) -> CubeError {

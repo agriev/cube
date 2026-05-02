@@ -211,6 +211,64 @@ pub enum MetaCommand {
         payload: Vec<u8>,
     },
 
+    // ---- Cat C: create-with-struct (M3.3.b.1) ---------------------------
+    // Each of these takes a metastore row struct (Chunk, MultiPartition,
+    // SourceCredentials, …) plus context. The raft module deliberately
+    // doesn't import metastore types — would create a cycle — so the
+    // struct is shipped as a `flexbuffers`-encoded blob in `*_blob`. The
+    // dispatch impl in `rocks_apply.rs` decodes it back into the typed
+    // shape before calling the trait method. Field documents the
+    // expected Rust type so the dispatch arm can be checked at review.
+    CreateChunk {
+        partition_id: u64,
+        /// Use `u64` not `usize` — flexbuffers + cross-platform stable.
+        row_count: u64,
+        in_memory: bool,
+        /// flex-encoded `Option<Row>` (`Row` from `crate::table`).
+        min_blob: Option<Vec<u8>>,
+        /// flex-encoded `Option<Row>`.
+        max_blob: Option<Vec<u8>>,
+    },
+    CreateWal {
+        table_id: u64,
+        /// `usize` in the trait — converted to `u64` here.
+        row_count: u64,
+    },
+    CreateIndex {
+        schema_name: String,
+        table_name: String,
+        /// flex-encoded `IndexDef` (from `crate::metastore`).
+        index_def_blob: Vec<u8>,
+    },
+    CreatePartitionedIndex {
+        schema: String,
+        name: String,
+        /// flex-encoded `Vec<Column>` (from `crate::metastore`).
+        columns_blob: Vec<u8>,
+        if_not_exists: bool,
+    },
+    CreateMultiPartition {
+        /// flex-encoded `MultiPartition`.
+        multi_partition_blob: Vec<u8>,
+    },
+    CreateOrUpdateSource {
+        name: String,
+        /// flex-encoded `SourceCredentials`.
+        credentials_blob: Vec<u8>,
+    },
+    CreateReplayHandle {
+        table_id: u64,
+        /// `usize` in trait — `u64` here.
+        location_index: u64,
+        /// flex-encoded `SeqPointer`.
+        seq_pointer_blob: Vec<u8>,
+    },
+    CreateReplayHandleFromSeqPointers {
+        table_id: u64,
+        /// flex-encoded `Option<Vec<Option<SeqPointer>>>`.
+        seq_pointers_blob: Vec<u8>,
+    },
+
     // ---- Atomic batch ----------------------------------------------------
     /// Multi-statement DDL — `BatchPipe`. Applied as a single RocksDB
     /// `WriteBatch` on the apply path so the whole sequence either
@@ -622,6 +680,76 @@ mod tests {
         round_trip(MetaCommand::ReleasePartitionedLock {
             payload_version: 1,
             payload: vec![],
+        });
+    }
+
+    #[test]
+    fn cat_c_create_with_struct_round_trip() {
+        // Cat C variants — each carries a struct as a flex blob plus
+        // primitive context. The codec doesn't decode the blob; we
+        // just verify the byte-for-byte round-trip.
+        round_trip(MetaCommand::CreateChunk {
+            partition_id: 1,
+            row_count: 12345,
+            in_memory: true,
+            min_blob: Some(vec![0x01; 16]),
+            max_blob: None,
+        });
+        round_trip(MetaCommand::CreateChunk {
+            partition_id: u64::MAX,
+            row_count: 0,
+            in_memory: false,
+            min_blob: None,
+            max_blob: Some(vec![]),
+        });
+
+        round_trip(MetaCommand::CreateWal {
+            table_id: 7,
+            row_count: 1024,
+        });
+
+        round_trip(MetaCommand::CreateIndex {
+            schema_name: "public".into(),
+            table_name: "orders".into(),
+            index_def_blob: vec![0xCA; 64],
+        });
+
+        round_trip(MetaCommand::CreatePartitionedIndex {
+            schema: "public".into(),
+            name: "by_country".into(),
+            columns_blob: vec![0xFE; 32],
+            if_not_exists: true,
+        });
+        round_trip(MetaCommand::CreatePartitionedIndex {
+            schema: String::new(),
+            name: String::new(),
+            columns_blob: vec![],
+            if_not_exists: false,
+        });
+
+        round_trip(MetaCommand::CreateMultiPartition {
+            multi_partition_blob: vec![0xAA; 256],
+        });
+
+        round_trip(MetaCommand::CreateOrUpdateSource {
+            name: "kafka1".into(),
+            credentials_blob: vec![0xCC; 128],
+        });
+
+        round_trip(MetaCommand::CreateReplayHandle {
+            table_id: 42,
+            location_index: 0,
+            seq_pointer_blob: vec![0xBB; 32],
+        });
+        round_trip(MetaCommand::CreateReplayHandle {
+            table_id: u64::MAX,
+            location_index: u64::MAX,
+            seq_pointer_blob: vec![],
+        });
+
+        round_trip(MetaCommand::CreateReplayHandleFromSeqPointers {
+            table_id: 99,
+            seq_pointers_blob: vec![0xDD; 192],
         });
     }
 
