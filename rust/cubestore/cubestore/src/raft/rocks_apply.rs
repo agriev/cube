@@ -51,7 +51,7 @@ use crate::metastore::{
 use chrono::{DateTime, TimeZone, Utc};
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult};
 use crate::raft::state_machine::Apply;
-use crate::table::Row;
+// Row is imported inside the SwapActivePartitions arm where it's used.
 use crate::CubeError;
 use async_trait::async_trait;
 use flexbuffers::Reader;
@@ -899,21 +899,31 @@ mod tests {
         let (store, sp, rp) = setup_store(test_name);
         let apply = RocksMetaStoreApply::new(store.clone());
 
-        // Pick a u128 with bits set in both halves so we can prove the
-        // (low, high) split + rejoin doesn't mangle anything.
+        // Pick a u128 with bits set in both halves so we can prove
+        // the (low, high) split + rejoin doesn't mangle anything.
+        // `set_current_snapshot` validates the id against existing
+        // snapshots, so it will error — but the error message
+        // contains the rejoined id, so we use that as the wire
+        // round-trip assertion.
         let original: u128 =
             ((0x1234_5678_9ABC_DEF0u128) << 64) | 0xDEAD_BEEF_CAFE_BABEu128;
         let snapshot_id_low = original as u64;
         let snapshot_id_high = (original >> 64) as u64;
 
-        let r = apply
+        let err = apply
             .apply(MetaCommand::SetCurrentSnapshot {
                 snapshot_id_low,
                 snapshot_id_high,
             })
             .await
-            .expect("apply SetCurrentSnapshot");
-        r.into_unit().expect("must be Unit");
+            .expect_err("snapshot id never existed — error expected");
+        let original_str = original.to_string();
+        assert!(
+            err.message.contains(&original_str),
+            "error must reference the rejoined u128 to prove the \
+             leader's id reaches the apply path intact: got {:?}",
+            err.message
+        );
 
         cleanup(&sp, &rp);
     }
