@@ -1725,6 +1725,76 @@ impl RocksMetaStore {
         .await
     }
 
+    /// HA-determinism: `deactivate_chunk` with leader-stamped now for
+    /// the resulting `deactivated_at` field. M3.4.c.
+    pub async fn deactivate_chunk_with_now(
+        &self,
+        chunk_id: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(), CubeError> {
+        self.write_operation("deactivate_chunk", move |db_ref, batch_pipe| {
+            ChunkRocksTable::new(db_ref.clone()).update_with_fn(
+                chunk_id,
+                move |row| row.deactivate_pure(now),
+                batch_pipe,
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// HA-determinism variant of `deactivate_chunks` — same `now` is
+    /// stamped on every chunk in the batch. M3.4.c.
+    pub async fn deactivate_chunks_with_now(
+        &self,
+        chunk_ids: Vec<u64>,
+        now: DateTime<Utc>,
+    ) -> Result<(), CubeError> {
+        self.write_operation("deactivate_chunks", move |db_ref, batch_pipe| {
+            let table = ChunkRocksTable::new(db_ref.clone());
+            for chunk_id in chunk_ids {
+                table.update_with_fn(chunk_id, move |row| row.deactivate_pure(now), batch_pipe)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// HA-determinism: `update_heart_beat` with leader-stamped now.
+    /// M3.4.c.
+    pub async fn update_heart_beat_with_now(
+        &self,
+        job_id: u64,
+        now: DateTime<Utc>,
+    ) -> Result<IdRow<Job>, CubeError> {
+        self.write_operation("update_heart_beat", move |db_ref, batch_pipe| {
+            Ok(JobRocksTable::new(db_ref).update_with_fn(
+                job_id,
+                move |row| row.update_heart_beat_pure(now),
+                batch_pipe,
+            )?)
+        })
+        .await
+    }
+
+    /// HA-determinism: `update_status` with leader-stamped now.
+    /// M3.4.c.
+    pub async fn update_status_with_now(
+        &self,
+        job_id: u64,
+        status: JobStatus,
+        now: DateTime<Utc>,
+    ) -> Result<IdRow<Job>, CubeError> {
+        self.write_operation("update_status", move |db_ref, batch_pipe| {
+            Ok(JobRocksTable::new(db_ref).update_with_fn(
+                job_id,
+                move |row| row.update_status_pure(status.clone(), now),
+                batch_pipe,
+            )?)
+        })
+        .await
+    }
+
     /// HA-determinism variant of `create_table` — takes an explicit
     /// `now` for the new row's `created_at`. The trait method
     /// `MetaStore::create_table` delegates here with `Utc::now()`,
@@ -3938,26 +4008,12 @@ impl MetaStore for RocksMetaStore {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn deactivate_chunk(&self, chunk_id: u64) -> Result<(), CubeError> {
-        self.write_operation("deactivate_chunk", move |db_ref, batch_pipe| {
-            ChunkRocksTable::new(db_ref.clone()).update_with_fn(
-                chunk_id,
-                |row| row.deactivate(),
-                batch_pipe,
-            )?;
-            Ok(())
-        })
-        .await
+        // M3.4.c: delegate so HA mode can use the leader-stamped now.
+        self.deactivate_chunk_with_now(chunk_id, Utc::now()).await
     }
     #[tracing::instrument(level = "trace", skip(self))]
     async fn deactivate_chunks(&self, chunk_ids: Vec<u64>) -> Result<(), CubeError> {
-        self.write_operation("deactivate_chunks", move |db_ref, batch_pipe| {
-            let table = ChunkRocksTable::new(db_ref.clone());
-            for chunk_id in chunk_ids {
-                table.update_with_fn(chunk_id, |row| row.deactivate(), batch_pipe)?;
-            }
-            Ok(())
-        })
-        .await
+        self.deactivate_chunks_with_now(chunk_ids, Utc::now()).await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -4359,26 +4415,13 @@ impl MetaStore for RocksMetaStore {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn update_heart_beat(&self, job_id: u64) -> Result<IdRow<Job>, CubeError> {
-        self.write_operation("update_heart_beat", move |db_ref, batch_pipe| {
-            Ok(JobRocksTable::new(db_ref).update_with_fn(
-                job_id,
-                |row| row.update_heart_beat(),
-                batch_pipe,
-            )?)
-        })
-        .await
+        // M3.4.c: delegate so HA mode can use the leader-stamped now.
+        self.update_heart_beat_with_now(job_id, Utc::now()).await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn update_status(&self, job_id: u64, status: JobStatus) -> Result<IdRow<Job>, CubeError> {
-        self.write_operation("update_status", move |db_ref, batch_pipe| {
-            Ok(JobRocksTable::new(db_ref).update_with_fn(
-                job_id,
-                |row| row.update_status(status),
-                batch_pipe,
-            )?)
-        })
-        .await
+        self.update_status_with_now(job_id, status, Utc::now()).await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

@@ -796,13 +796,28 @@ impl MetaStore for RaftMetaStore {
             .chunk_update_last_inserted(chunk_ids, last_inserted_at)
             .await
     }
-    // M3.5.* TODO: deactivate_chunk — Cat A but no variant yet.
     async fn deactivate_chunk(&self, chunk_id: u64) -> Result<(), CubeError> {
-        self.store.deactivate_chunk(chunk_id).await
+        // M3.4.c: leader-stamped now for `Chunk::deactivated_at`.
+        let assigned_now_millis = Utc::now().timestamp_millis();
+        self.raft
+            .propose(MetaCommand::DeactivateChunk {
+                chunk_id,
+                assigned_now_millis,
+            })
+            .await?
+            .into_unit()
+            .map_err(|e| Self::mismatch("deactivate_chunk", e))
     }
-    // M3.5.* TODO: deactivate_chunks — Cat E small.
     async fn deactivate_chunks(&self, chunk_ids: Vec<u64>) -> Result<(), CubeError> {
-        self.store.deactivate_chunks(chunk_ids).await
+        let assigned_now_millis = Utc::now().timestamp_millis();
+        self.raft
+            .propose(MetaCommand::DeactivateChunks {
+                chunk_ids,
+                assigned_now_millis,
+            })
+            .await?
+            .into_unit()
+            .map_err(|e| Self::mismatch("deactivate_chunks", e))
     }
     async fn swap_chunks(
         &self,
@@ -981,18 +996,26 @@ impl MetaStore for RaftMetaStore {
         status: JobStatus,
     ) -> Result<IdRow<Job>, CubeError> {
         let status_blob = Self::encode_blob("update_status", "status", &status)?;
+        // M3.4.c: leader-stamped now for `Job::last_heart_beat`.
+        let assigned_now_millis = Utc::now().timestamp_millis();
         self.raft
             .propose(MetaCommand::UpdateStatus {
                 job_id,
                 status_blob,
+                assigned_now_millis,
             })
             .await?
             .into_id_row(IdRowKind::Job)
             .map_err(|e| Self::mismatch("update_status", e))
     }
     async fn update_heart_beat(&self, job_id: u64) -> Result<IdRow<Job>, CubeError> {
+        // M3.4.c: leader-stamped now.
+        let assigned_now_millis = Utc::now().timestamp_millis();
         self.raft
-            .propose(MetaCommand::UpdateHeartBeat { job_id })
+            .propose(MetaCommand::UpdateHeartBeat {
+                job_id,
+                assigned_now_millis,
+            })
             .await?
             .into_id_row(IdRowKind::Job)
             .map_err(|e| Self::mismatch("update_heart_beat", e))

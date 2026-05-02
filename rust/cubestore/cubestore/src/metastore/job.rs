@@ -100,11 +100,19 @@ impl Job {
         &self.status
     }
 
+    /// Stamps `last_heart_beat` with `Utc::now()`. Non-deterministic;
+    /// HA callers use [`Self::update_status_pure`] with a leader-stamped
+    /// now. M3.4.c.
     pub fn update_status(&self, status: JobStatus) -> Job {
+        self.update_status_pure(status, Utc::now())
+    }
+
+    /// Pure: caller supplies `now` for `last_heart_beat`.
+    pub fn update_status_pure(&self, status: JobStatus, now: DateTime<Utc>) -> Job {
         Job {
             row_reference: self.row_reference.clone(),
             job_type: self.job_type.clone(),
-            last_heart_beat: Utc::now(),
+            last_heart_beat: now,
             status,
         }
     }
@@ -113,8 +121,16 @@ impl Job {
         self.update_status(JobStatus::ProcessingBy(node_name))
     }
 
+    pub fn start_processing_pure(&self, node_name: String, now: DateTime<Utc>) -> Job {
+        self.update_status_pure(JobStatus::ProcessingBy(node_name), now)
+    }
+
     pub fn update_heart_beat(&self) -> Job {
         self.update_status(self.status.clone())
+    }
+
+    pub fn update_heart_beat_pure(&self, now: DateTime<Utc>) -> Job {
+        self.update_status_pure(self.status.clone(), now)
     }
 
     pub fn completed(&self) -> Job {

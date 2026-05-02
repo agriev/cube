@@ -119,10 +119,18 @@ impl Chunk {
         Ok(c)
     }
 
+    /// Stamps `deactivated_at` with `Utc::now()`. Non-deterministic;
+    /// callers in HA mode use [`Self::deactivate_pure`] with a
+    /// leader-stamped now. M3.4.c.
     pub fn deactivate(&self) -> Chunk {
+        self.deactivate_pure(Utc::now())
+    }
+
+    /// Pure: caller supplies `now` for `deactivated_at`. M3.4.c.
+    pub fn deactivate_pure(&self, now: DateTime<Utc>) -> Chunk {
         let mut to_update = self.clone();
         to_update.active = false;
-        to_update.deactivated_at = Some(Utc::now());
+        to_update.deactivated_at = Some(now);
         to_update.replay_handle_id = None;
         to_update
     }

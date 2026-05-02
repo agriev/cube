@@ -230,6 +230,8 @@ pub enum MetaCommand {
     },
     UpdateHeartBeat {
         job_id: u64,
+        /// M3.4.c: leader-stamped `now` for the new `last_heart_beat`.
+        assigned_now_millis: i64,
     },
     SetCurrentSnapshot {
         // u128 — flexbuffers doesn't have native u128, so encode as
@@ -357,6 +359,8 @@ pub enum MetaCommand {
         job_id: u64,
         /// flex-encoded `JobStatus` (enum).
         status_blob: Vec<u8>,
+        /// M3.4.c: leader-stamped `now` for the new `last_heart_beat`.
+        assigned_now_millis: i64,
     },
 
     // ---- Cat E: atomic chunk swap ops (M3.3.b.2) ------------------------
@@ -376,6 +380,16 @@ pub enum MetaCommand {
     },
     DeactivateChunksWithoutCheck {
         deactivate_ids: Vec<u64>,
+    },
+    /// M3.4.c: deactivate_chunk now ships through Raft so its
+    /// `deactivated_at` stamp comes from the leader's clock.
+    DeactivateChunk {
+        chunk_id: u64,
+        assigned_now_millis: i64,
+    },
+    DeactivateChunks {
+        chunk_ids: Vec<u64>,
+        assigned_now_millis: i64,
     },
     ActivateChunks {
         table_id: u64,
@@ -852,7 +866,10 @@ mod tests {
             schema_id: 1,
             new_schema_name: "renamed".into(),
         });
-        round_trip(MetaCommand::UpdateHeartBeat { job_id: 7 });
+        round_trip(MetaCommand::UpdateHeartBeat {
+            job_id: 7,
+            assigned_now_millis: 1_700_000_000_000,
+        });
         round_trip(MetaCommand::SetCurrentSnapshot {
             snapshot_id_low: 0xDEAD_BEEF_CAFE_BABE,
             snapshot_id_high: 0x1234_5678_9ABC_DEF0,
@@ -914,6 +931,23 @@ mod tests {
         round_trip(MetaCommand::UpdateStatus {
             job_id: 42,
             status_blob: vec![0xBB; 64],
+            assigned_now_millis: 0,
+        });
+    }
+
+    #[test]
+    fn deactivate_chunk_round_trip() {
+        round_trip(MetaCommand::DeactivateChunk {
+            chunk_id: 1,
+            assigned_now_millis: 1_700_000_000_000,
+        });
+        round_trip(MetaCommand::DeactivateChunks {
+            chunk_ids: vec![1, 2, 3],
+            assigned_now_millis: 0,
+        });
+        round_trip(MetaCommand::DeactivateChunks {
+            chunk_ids: vec![],
+            assigned_now_millis: i64::MIN,
         });
     }
 

@@ -328,6 +328,24 @@ impl Apply for RocksMetaStoreApply {
                     .await?;
                 Ok(MetaCommandResult::Unit)
             }
+            MetaCommand::DeactivateChunk {
+                chunk_id,
+                assigned_now_millis,
+            } => {
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
+                self.store.deactivate_chunk_with_now(chunk_id, now).await?;
+                Ok(MetaCommandResult::Unit)
+            }
+            MetaCommand::DeactivateChunks {
+                chunk_ids,
+                assigned_now_millis,
+            } => {
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
+                self.store
+                    .deactivate_chunks_with_now(chunk_ids, now)
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
             MetaCommand::ActivateChunks {
                 table_id,
                 uploaded_chunk_ids,
@@ -356,8 +374,12 @@ impl Apply for RocksMetaStoreApply {
                 let row = self.store.delete_job(job_id).await?;
                 wrap_id_row(IdRowKind::Job, &row)
             }
-            MetaCommand::UpdateHeartBeat { job_id } => {
-                let row = self.store.update_heart_beat(job_id).await?;
+            MetaCommand::UpdateHeartBeat {
+                job_id,
+                assigned_now_millis,
+            } => {
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
+                let row = self.store.update_heart_beat_with_now(job_id, now).await?;
                 wrap_id_row(IdRowKind::Job, &row)
             }
             MetaCommand::AddJob { job_blob } => {
@@ -382,9 +404,14 @@ impl Apply for RocksMetaStoreApply {
             MetaCommand::UpdateStatus {
                 job_id,
                 status_blob,
+                assigned_now_millis,
             } => {
                 let status: JobStatus = decode_typed_blob(&status_blob, "status_blob")?;
-                let row = self.store.update_status(job_id, status).await?;
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
+                let row = self
+                    .store
+                    .update_status_with_now(job_id, status, now)
+                    .await?;
                 wrap_id_row(IdRowKind::Job, &row)
             }
 
