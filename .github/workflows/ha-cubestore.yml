@@ -77,12 +77,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cubestore-
 
-      - name: Install Linux build prereqs (libpq, sasl, etc.)
+      - name: Install Linux build prereqs (cmake, sasl, libclang, etc.)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake build-essential pkg-config libssl-dev libsasl2-dev \
-            libpq-dev liblz4-dev libzstd-dev
+            cmake build-essential pkg-config \
+            libssl-dev libsasl2-dev libpq-dev liblz4-dev libzstd-dev \
+            clang libclang-dev
 
       - name: Install Rust toolchain pinned in rust-toolchain.toml
         uses: dtolnay/rust-toolchain@master
