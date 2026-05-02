@@ -42,9 +42,8 @@
 
 use crate::metastore::multi_index::MultiPartition;
 use crate::metastore::replay_handle::SeqPointer;
-use crate::metastore::{
-    Column, IndexDef, MetaStore, Partition, RocksMetaStore, SourceCredentials,
-};
+use crate::metastore::source::SourceCredentials;
+use crate::metastore::{Column, IndexDef, MetaStore, Partition, RocksMetaStore};
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult};
 use crate::raft::state_machine::Apply;
 use crate::table::Row;
