@@ -243,6 +243,183 @@ pub struct MetaCommandEnvelope {
     pub command: MetaCommand,
 }
 
+/// Tag for the row payload kind carried by `MetaCommandResult::IdRow` /
+/// `MetaCommandResult::OptionalIdRow`. The raft module deliberately does
+/// not import metastore row types directly (would create a cycle —
+/// metastore depends on the raft module for replication, and the raft
+/// module would then transitively depend on metastore). Instead we ship
+/// the row as a flexbuffer-encoded blob plus this tag; the wrapper-style
+/// `RaftMetaStore: MetaStore` impl decodes it into the right `IdRow<T>`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IdRowKind {
+    Schema,
+    Table,
+    Partition,
+    Chunk,
+    Wal,
+    Job,
+    Source,
+    ReplayHandle,
+    MultiPartition,
+    MultiIndex,
+    Index,
+}
+
+/// Typed return shape of an applied `MetaCommand`. Mirrors the
+/// `Result<...>` shapes used across the `MetaStore` trait.
+///
+/// The matrix of trait return types is small and well-defined:
+///
+/// - `()` → `Unit`
+/// - `bool` → `Bool` (only `swap_compacted_chunks` returns this)
+/// - `IdRow<T>` → `IdRow { kind, payload }`
+/// - `Option<IdRow<T>>` → `OptionalIdRow { kind, payload }`
+///
+/// The wrapper impl on `RaftMetaStore` reads the matching variant
+/// after `propose(...).await?` and decodes the payload via flexbuffers.
+/// Variant mismatch is a **bug** — it indicates a write method is
+/// returning a result shape that doesn't match its declared trait
+/// return — and is reported as a `CubeError::internal`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MetaCommandResult {
+    Unit,
+    Bool(bool),
+    IdRow {
+        kind: IdRowKind,
+        /// flexbuffer-encoded `IdRow<T>` matching `kind`.
+        payload: Vec<u8>,
+    },
+    OptionalIdRow {
+        kind: IdRowKind,
+        /// `None` is encoded as `None` here directly so callers can
+        /// distinguish "the operation succeeded but produced no row"
+        /// (e.g. `add_job` returning `None` when a duplicate exists)
+        /// from "the call produced an unrelated variant".
+        payload: Option<Vec<u8>>,
+    },
+}
+
+impl MetaCommandResult {
+    /// Build an `IdRow` result from any serializable row.
+    pub fn id_row<T: serde::Serialize>(
+        kind: IdRowKind,
+        row: &T,
+    ) -> Result<Self, MetaCommandCodecError> {
+        Ok(Self::IdRow {
+            kind,
+            payload: encode_flex(row)?,
+        })
+    }
+
+    /// Build an `OptionalIdRow` result.
+    pub fn optional_id_row<T: serde::Serialize>(
+        kind: IdRowKind,
+        row: Option<&T>,
+    ) -> Result<Self, MetaCommandCodecError> {
+        Ok(Self::OptionalIdRow {
+            kind,
+            payload: match row {
+                Some(r) => Some(encode_flex(r)?),
+                None => None,
+            },
+        })
+    }
+
+    /// Decode the payload as a typed `IdRow<T>`. Errors if the result
+    /// is not an `IdRow` of the expected `kind`.
+    pub fn into_id_row<T: DeserializeOwned>(
+        self,
+        expected: IdRowKind,
+    ) -> Result<T, MetaCommandResultMismatch> {
+        match self {
+            Self::IdRow { kind, payload } if kind == expected => {
+                decode_flex::<T>(&payload).map_err(MetaCommandResultMismatch::Codec)
+            }
+            other => Err(MetaCommandResultMismatch::Variant {
+                expected: format!("IdRow({:?})", expected),
+                got: other.variant_name().to_string(),
+            }),
+        }
+    }
+
+    /// Decode the payload as a typed `Option<IdRow<T>>`. Errors if the
+    /// result is not an `OptionalIdRow` of the expected `kind`.
+    pub fn into_optional_id_row<T: DeserializeOwned>(
+        self,
+        expected: IdRowKind,
+    ) -> Result<Option<T>, MetaCommandResultMismatch> {
+        match self {
+            Self::OptionalIdRow { kind, payload } if kind == expected => match payload {
+                Some(bytes) => decode_flex::<T>(&bytes)
+                    .map(Some)
+                    .map_err(MetaCommandResultMismatch::Codec),
+                None => Ok(None),
+            },
+            other => Err(MetaCommandResultMismatch::Variant {
+                expected: format!("OptionalIdRow({:?})", expected),
+                got: other.variant_name().to_string(),
+            }),
+        }
+    }
+
+    /// Assert the result is `Unit`. Errors otherwise.
+    pub fn into_unit(self) -> Result<(), MetaCommandResultMismatch> {
+        match self {
+            Self::Unit => Ok(()),
+            other => Err(MetaCommandResultMismatch::Variant {
+                expected: "Unit".into(),
+                got: other.variant_name().to_string(),
+            }),
+        }
+    }
+
+    /// Assert the result is `Bool` and unwrap it. Errors otherwise.
+    pub fn into_bool(self) -> Result<bool, MetaCommandResultMismatch> {
+        match self {
+            Self::Bool(b) => Ok(b),
+            other => Err(MetaCommandResultMismatch::Variant {
+                expected: "Bool".into(),
+                got: other.variant_name().to_string(),
+            }),
+        }
+    }
+
+    fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Unit => "Unit",
+            Self::Bool(_) => "Bool",
+            Self::IdRow { .. } => "IdRow",
+            Self::OptionalIdRow { .. } => "OptionalIdRow",
+        }
+    }
+}
+
+/// Returned when a caller asks `MetaCommandResult` for a shape that
+/// doesn't match what the apply path produced. In practice this only
+/// fires when a write method's apply impl returns the wrong variant —
+/// i.e. it is a bug in `RocksMetaStoreApply`, not a runtime data
+/// condition.
+#[derive(Debug)]
+pub enum MetaCommandResultMismatch {
+    Variant { expected: String, got: String },
+    Codec(MetaCommandCodecError),
+}
+
+impl fmt::Display for MetaCommandResultMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Variant { expected, got } => write!(
+                f,
+                "MetaCommandResult variant mismatch: expected={} got={}",
+                expected, got
+            ),
+            Self::Codec(e) => write!(f, "MetaCommandResult payload decode: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for MetaCommandResultMismatch {}
+
 impl MetaCommand {
     pub fn encode(&self) -> Result<Vec<u8>, MetaCommandCodecError> {
         let envelope = MetaCommandEnvelope {
@@ -490,6 +667,127 @@ mod tests {
             err,
             MetaCommandCodecError::Reader(_) | MetaCommandCodecError::Deserialize(_)
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // M3.2 — MetaCommandResult round-trip + helper coverage
+    // -------------------------------------------------------------------
+
+    fn result_round_trip(r: MetaCommandResult) {
+        // Encoded-as-a-flexbuffer round-trip — same codec the apply path
+        // uses to send the result back through the oneshot in M3.3+.
+        let bytes = encode_flex(&r).expect("encode result");
+        let decoded: MetaCommandResult = decode_flex(&bytes).expect("decode result");
+        assert_eq!(r, decoded, "MetaCommandResult round-trip mismatch");
+    }
+
+    #[test]
+    fn meta_command_result_unit_round_trip() {
+        result_round_trip(MetaCommandResult::Unit);
+    }
+
+    #[test]
+    fn meta_command_result_bool_round_trip() {
+        result_round_trip(MetaCommandResult::Bool(true));
+        result_round_trip(MetaCommandResult::Bool(false));
+    }
+
+    #[test]
+    fn meta_command_result_id_row_round_trip() {
+        // Use a tuple proxy: the wire layer is type-agnostic — it just
+        // ships flexbuffer bytes — so any serializable shape exercises
+        // the round-trip.
+        let row = (42u64, "schema_name".to_string(), true);
+        let r = MetaCommandResult::id_row(IdRowKind::Schema, &row).expect("build");
+        result_round_trip(r.clone());
+
+        let decoded: (u64, String, bool) = r.into_id_row(IdRowKind::Schema).expect("decode");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn meta_command_result_optional_id_row_round_trip() {
+        // Some(...) and None both must round-trip.
+        let row = (7u64, "row".to_string());
+        let some = MetaCommandResult::optional_id_row(IdRowKind::Job, Some(&row)).expect("build");
+        result_round_trip(some.clone());
+
+        let none = MetaCommandResult::optional_id_row::<(u64, String)>(IdRowKind::Job, None)
+            .expect("build none");
+        result_round_trip(none.clone());
+
+        let decoded_some: Option<(u64, String)> =
+            some.into_optional_id_row(IdRowKind::Job).expect("decode");
+        assert_eq!(decoded_some, Some(row));
+
+        let decoded_none: Option<(u64, String)> =
+            none.into_optional_id_row(IdRowKind::Job).expect("decode");
+        assert_eq!(decoded_none, None);
+    }
+
+    #[test]
+    fn meta_command_result_kind_mismatch_errors() {
+        // Build an IdRow tagged Schema, ask for it as Table — must error.
+        let row = (1u64, "name".to_string());
+        let r = MetaCommandResult::id_row(IdRowKind::Schema, &row).expect("build");
+        let err = r.into_id_row::<(u64, String)>(IdRowKind::Table).unwrap_err();
+        match err {
+            MetaCommandResultMismatch::Variant { expected, got } => {
+                assert!(expected.contains("Table"), "expected msg: {}", expected);
+                assert!(got.contains("IdRow"), "got msg: {}", got);
+            }
+            other => panic!("expected Variant mismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn meta_command_result_variant_mismatch_errors() {
+        // `into_unit` on a `Bool` must error.
+        let r = MetaCommandResult::Bool(true);
+        let err = r.into_unit().unwrap_err();
+        match err {
+            MetaCommandResultMismatch::Variant { expected, got } => {
+                assert_eq!(expected, "Unit");
+                assert_eq!(got, "Bool");
+            }
+            other => panic!("expected Variant mismatch, got {:?}", other),
+        }
+
+        // `into_bool` on a `Unit` must error.
+        let r = MetaCommandResult::Unit;
+        let err = r.into_bool().unwrap_err();
+        match err {
+            MetaCommandResultMismatch::Variant { expected, got } => {
+                assert_eq!(expected, "Bool");
+                assert_eq!(got, "Unit");
+            }
+            other => panic!("expected Variant mismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn id_row_kind_round_trip_all_variants() {
+        // Sanity: every IdRowKind variant must encode + decode exactly.
+        // If a future variant is added but not exercised here, the test
+        // is a forcing function to keep coverage current.
+        let all = [
+            IdRowKind::Schema,
+            IdRowKind::Table,
+            IdRowKind::Partition,
+            IdRowKind::Chunk,
+            IdRowKind::Wal,
+            IdRowKind::Job,
+            IdRowKind::Source,
+            IdRowKind::ReplayHandle,
+            IdRowKind::MultiPartition,
+            IdRowKind::MultiIndex,
+            IdRowKind::Index,
+        ];
+        for kind in all {
+            let bytes = encode_flex(&kind).unwrap();
+            let decoded: IdRowKind = decode_flex(&bytes).unwrap();
+            assert_eq!(decoded, kind);
+        }
     }
 
     #[test]

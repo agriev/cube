@@ -34,7 +34,7 @@
 //! `MetaCommand` variant to the matching `RocksMetaStore::*` write
 //! method inside a single RocksDB `WriteBatch`.
 
-use crate::raft::command::{MetaCommand, MetaCommandCodecError};
+use crate::raft::command::{MetaCommand, MetaCommandCodecError, MetaCommandResult};
 use crate::raft::storage::{RaftStorage, RaftStorageError, SharedRaftStorage};
 use crate::CubeError;
 use raft::eraftpb::{ConfState, Entry, EntryType, Message};
@@ -46,23 +46,25 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// A pluggable side-effect that the Raft apply loop runs for every
-/// committed `MetaCommand`. M2 uses a test implementation; M3 will
+/// committed `MetaCommand`. M2 used a test implementation; M3.3 will
 /// provide one backed by `RocksMetaStore`.
 ///
 /// Implementations must be **deterministic** — every replica that
 /// applies the same sequence of `MetaCommand`s must reach the same
 /// observable state, byte-for-byte. See `docs/ha/PLAN.md` risk #1.
+///
+/// The return value mirrors the shape of the underlying `MetaStore`
+/// write method via `MetaCommandResult`:
+/// - `()` returns                 → `MetaCommandResult::Unit`
+/// - `bool` returns               → `MetaCommandResult::Bool`
+/// - `IdRow<T>` returns           → `MetaCommandResult::IdRow`
+/// - `Option<IdRow<T>>` returns   → `MetaCommandResult::OptionalIdRow`
+///
+/// The wrapper-style `RaftMetaStore: MetaStore` impl reads the
+/// matching variant after `propose(...).await?` and decodes the
+/// payload back into the trait's typed return.
 pub trait Apply: Send + Sync + 'static {
-    fn apply(&self, cmd: MetaCommand) -> Result<ApplyOutcome, CubeError>;
-}
-
-/// Typed result returned from `Apply::apply`. Currently a single
-/// `Success` variant; M3 will replace it with a sum-type that mirrors
-/// the return shape of every write method (e.g. `IdRow<Schema>` for
-/// `create_schema`, `()` for `swap_active_partitions`).
-#[derive(Debug, Clone, PartialEq)]
-pub enum ApplyOutcome {
-    Success,
+    fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError>;
 }
 
 /// Errors specific to the Raft layer (separate from the codec errors
@@ -104,7 +106,7 @@ impl From<RaftError> for CubeError {
 /// command and reply on `respond_to` once it has applied."
 struct Proposal {
     command: MetaCommand,
-    respond_to: oneshot::Sender<Result<ApplyOutcome, CubeError>>,
+    respond_to: oneshot::Sender<Result<MetaCommandResult, CubeError>>,
 }
 
 /// Handle exposed to the rest of cubestore — clones cheaply, thread-safe.
@@ -156,7 +158,7 @@ impl RaftMetaStore {
         let raw = RawNode::new(&cfg, storage.clone(), &logger)?;
 
         let (tx, rx) = mpsc::unbounded_channel::<Proposal>();
-        let pending = std::collections::HashMap::<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>::new();
+        let pending = std::collections::HashMap::<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>::new();
 
         tokio::spawn(run_node(raw, storage, rx, apply, pending, logger));
 
@@ -164,7 +166,7 @@ impl RaftMetaStore {
     }
 
     /// Propose a command and resolve the future once it has applied.
-    pub async fn propose(&self, command: MetaCommand) -> Result<ApplyOutcome, CubeError> {
+    pub async fn propose(&self, command: MetaCommand) -> Result<MetaCommandResult, CubeError> {
         let (tx, rx) = oneshot::channel();
         self.proposals
             .send(Proposal {
@@ -182,7 +184,7 @@ async fn run_node<A: Apply>(
     storage: SharedRaftStorage,
     mut proposals: mpsc::UnboundedReceiver<Proposal>,
     apply: Arc<A>,
-    mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>,
+    mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
     logger: slog::Logger,
 ) {
     let _ = logger; // reserved for future structured-log calls
@@ -242,7 +244,7 @@ fn drive_ready<A: Apply>(
     raw: &mut RawNode<SharedRaftStorage>,
     storage: &SharedRaftStorage,
     apply: &Arc<A>,
-    pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>,
+    pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
 ) {
     if !raw.has_ready() {
         return;
@@ -296,7 +298,7 @@ fn drive_ready<A: Apply>(
 fn apply_committed<A: Apply>(
     entries: &[Entry],
     apply: &Arc<A>,
-    pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<ApplyOutcome, CubeError>>>,
+    pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
 ) -> Option<u64> {
     let mut highest = None;
     for ent in entries {
@@ -367,9 +369,9 @@ mod tests {
     }
 
     impl Apply for RecordingApply {
-        fn apply(&self, cmd: MetaCommand) -> Result<ApplyOutcome, CubeError> {
+        fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
             self.seen.lock().unwrap().push(cmd);
-            Ok(ApplyOutcome::Success)
+            Ok(MetaCommandResult::Unit)
         }
     }
 
@@ -392,11 +394,104 @@ mod tests {
             .await
             .expect("propose timed out")
             .expect("propose failed");
-        assert_eq!(outcome, ApplyOutcome::Success);
+        assert_eq!(outcome, MetaCommandResult::Unit);
 
         let recorded = apply.snapshot();
         assert_eq!(recorded.len(), 1, "exactly one apply expected");
         assert_eq!(recorded[0], cmd, "applied command must equal proposed");
+    }
+
+    /// `Apply` impl that returns a different `MetaCommandResult` shape
+    /// per command — exercises the M3.2 typed return path end-to-end
+    /// (encode → propose → apply → decode in caller).
+    struct TypedReturnApply;
+    impl Apply for TypedReturnApply {
+        fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
+            use crate::raft::command::IdRowKind;
+            // Pretend rows: just `(id, name)` tuples. The wire layer
+            // doesn't care about the actual `IdRow<T>` type, only that
+            // the bytes round-trip via flexbuffers — so a tuple proxy
+            // is enough to test the result shape.
+            match cmd {
+                MetaCommand::CreateSchema { schema_name, .. } => {
+                    let row = (1u64, schema_name);
+                    MetaCommandResult::id_row(IdRowKind::Schema, &row)
+                        .map_err(|e| CubeError::internal(e.to_string()))
+                }
+                MetaCommand::SwapCompactedChunks { .. } => Ok(MetaCommandResult::Bool(true)),
+                MetaCommand::DropTable { .. } => Ok(MetaCommandResult::Unit),
+                _ => Ok(MetaCommandResult::Unit),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typed_results_propagate_back_to_caller() {
+        use crate::raft::command::IdRowKind;
+        let dir = TempDir::new().unwrap();
+        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::new(TypedReturnApply))
+            .expect("boot single-node raft");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Unit return.
+        let r = store
+            .propose(MetaCommand::DropTable { table_id: 1 })
+            .await
+            .expect("propose drop_table");
+        r.into_unit().expect("must be Unit");
+
+        // Bool return — mirrors `swap_compacted_chunks`.
+        let r = store
+            .propose(MetaCommand::SwapCompactedChunks {
+                partition_id: 1,
+                old_chunk_ids: vec![1, 2],
+                new_chunk: 3,
+                new_chunk_file_size: 100,
+            })
+            .await
+            .expect("propose swap_compacted_chunks");
+        assert!(r.into_bool().expect("must be Bool"));
+
+        // IdRow<Schema> return — mirrors `create_schema`. The caller
+        // decodes with the expected `IdRowKind::Schema` and gets a
+        // typed value back.
+        let r = store
+            .propose(MetaCommand::CreateSchema {
+                schema_name: "public".into(),
+                if_not_exists: true,
+            })
+            .await
+            .expect("propose create_schema");
+        let row: (u64, String) = r
+            .into_id_row(IdRowKind::Schema)
+            .expect("decode IdRow<Schema>");
+        assert_eq!(row, (1u64, "public".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn variant_mismatch_is_caller_error_not_panic() {
+        use crate::raft::command::IdRowKind;
+        // The Apply path returns `Bool` but the caller asks for an
+        // `IdRow` — must error cleanly (this is the diagnostic for a
+        // misimplemented Apply variant in M3.3).
+        let dir = TempDir::new().unwrap();
+        let store = RaftMetaStore::start_single_node(dir.path(), 1, Arc::new(TypedReturnApply))
+            .expect("boot single-node raft");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let r = store
+            .propose(MetaCommand::SwapCompactedChunks {
+                partition_id: 1,
+                old_chunk_ids: vec![],
+                new_chunk: 1,
+                new_chunk_file_size: 0,
+            })
+            .await
+            .expect("propose");
+        // Bool was produced — asking for IdRow must fail with mismatch,
+        // not panic.
+        let mismatch = r.into_id_row::<(u64, String)>(IdRowKind::Schema);
+        assert!(mismatch.is_err(), "must error on variant mismatch");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -470,7 +565,7 @@ mod tests {
         }
     }
     impl Apply for HashMapApply {
-        fn apply(&self, cmd: MetaCommand) -> Result<ApplyOutcome, CubeError> {
+        fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
             if let MetaCommand::CreateSchema {
                 schema_name,
                 if_not_exists,
@@ -481,7 +576,7 @@ mod tests {
                     .unwrap()
                     .insert(schema_name, if_not_exists);
             }
-            Ok(ApplyOutcome::Success)
+            Ok(MetaCommandResult::Unit)
         }
     }
 

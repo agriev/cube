@@ -80,14 +80,14 @@ heartbeat / time-based ones.
 
 ## M3 sub-milestones
 
-| # | Title | Estimated commits |
-|---|---|---|
-| **M3.1** | Catalog + 10 representative new variants in MetaCommand (Cat A + B) | 1-2 |
-| **M3.2** | `MetaCommandResult` enum with typed returns mirroring trait return shapes | 1 |
-| **M3.3** | `RocksMetaStoreApply: Apply` impl — dispatch table for every variant | 3-5 (incremental) |
-| **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | 2 |
-| **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | 1 |
-| **M3.6** | cubestore-sql-tests passing with HA mode (the critical-path gate) | 1-3 fixing edge cases |
+| # | Title | Status | Estimated commits |
+|---|---|---|---|
+| **M3.1** | Catalog + 14 new variants in MetaCommand (Cat A + B) | ✅ done (`m3.1-complete`) | 1 |
+| **M3.2** | `MetaCommandResult` enum with typed returns mirroring trait return shapes | ✅ done (`m3.2-complete`) | 1 |
+| **M3.3** | `RocksMetaStoreApply: Apply` impl — dispatch table for every variant | pending | 3-5 (incremental) |
+| **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
+| **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
+| **M3.6** | cubestore-sql-tests passing with HA mode (the critical-path gate) | pending | 1-3 fixing edge cases |
 
 Ordering matters: 3.4 (determinism) MUST land before 3.5 (config wiring)
 because flipping HA on without leader-assigned IDs causes silent
@@ -130,3 +130,35 @@ variants and `Generic` becomes unused (but stays in the enum for
 forward-compat — a future-method that lands during a rolling upgrade
 can ship as Generic on a new replica and apply correctly on a follower
 running the older binary).
+
+## M3.2 — return-shape design notes
+
+The trait's write methods produce exactly four return shapes:
+
+| Trait return                    | `MetaCommandResult` variant | # of methods |
+|---------------------------------|-----------------------------|--------------|
+| `Result<(), CubeError>`         | `Unit`                      | ~25          |
+| `Result<bool, CubeError>`       | `Bool`                      | 1 (`swap_compacted_chunks`) |
+| `Result<IdRow<T>, CubeError>`   | `IdRow { kind, payload }`   | ~50          |
+| `Result<Option<IdRow<T>>, ...>` | `OptionalIdRow { kind, .. }`| 4 (`add_job`, `start_processing_job`, `finalize_replay_handles`, `update_replay_handle_seq_pointer_if_exists` returning option) |
+
+The eleven distinct `T` values for `IdRow<T>` are tagged via `IdRowKind`
+(`Schema`, `Table`, `Partition`, `Chunk`, `Wal`, `Job`, `Source`,
+`ReplayHandle`, `MultiPartition`, `MultiIndex`, `Index`).
+
+**Why opaque payload + tag instead of typed payload variants?** The raft
+module deliberately doesn't import metastore row types — that would
+create a circular dependency (metastore depends on the raft module for
+replication, raft module would then transitively depend on metastore).
+Instead, the apply impl in M3.3 (`RocksMetaStoreApply`) calls
+`MetaCommandResult::id_row(kind, &row)` which flexbuffer-encodes the
+`IdRow<T>` and tags it with `kind`. The wrapper-style `RaftMetaStore:
+MetaStore` impl (which legitimately depends on metastore types) calls
+`result.into_id_row(IdRowKind::Schema)` to decode the typed value. The
+codec is verified by 6 round-trip tests in `command.rs::tests`.
+
+**Mismatch handling.** A variant mismatch (`into_unit` on a `Bool`,
+`into_id_row::<X>(IdRowKind::Schema)` on an `IdRow{kind: Table, ..}`)
+returns `MetaCommandResultMismatch` — never panics. This is the
+diagnostic for a misimplemented Apply variant in M3.3 and converts
+cleanly to `CubeError::internal` at the trait boundary.

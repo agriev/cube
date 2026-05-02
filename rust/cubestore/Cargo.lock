@@ -1592,6 +1592,7 @@ dependencies = [
  "pin-project-lite 0.2.14",
  "pretty_assertions",
  "prost",
+ "protobuf",
  "raft",
  "rand 0.8.5",
  "rdkafka",
