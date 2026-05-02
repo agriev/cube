@@ -162,3 +162,50 @@ codec is verified by 6 round-trip tests in `command.rs::tests`.
 returns `MetaCommandResultMismatch` — never panics. This is the
 diagnostic for a misimplemented Apply variant in M3.3 and converts
 cleanly to `CubeError::internal` at the trait boundary.
+
+## M3.3 — design decisions parked here
+
+When M3.3 starts:
+
+1. **Sync `Apply` → async `Apply`.** Today the trait is
+   `fn apply(&self, cmd) -> Result<...>`. Real `RocksMetaStore`
+   write methods are async (they queue through `write_operation`
+   onto `rw_loop`), so the trait must become
+   `async fn apply(...)` (via `#[async_trait]`).
+   The Raft apply task in `state_machine::run_node` is already a
+   tokio task — `drive_ready` becomes `async fn` and awaits each
+   apply call. No new threads.
+
+2. **Dispatch table location.** New file
+   `src/raft/rocks_apply.rs` with
+   `pub struct RocksMetaStoreApply { store: Arc<RocksMetaStore> }`
+   and one match arm per `MetaCommand` variant. Each arm calls
+   the matching trait method on `store` and wraps the return
+   into the right `MetaCommandResult` variant via the helper
+   constructors in `command.rs`.
+
+3. **Atomicity.** `MetaCommand::Batch { commands }` must apply
+   inside a single `write_operation` so the underlying RocksDB
+   `WriteBatch` covers all of them. Sub-dispatch happens against
+   the same `BatchPipe`. This requires a slightly different shape
+   than the per-variant arms — implement `apply_batch` separately
+   from `apply_single`.
+
+4. **Determinism gate before M3.5.** M3.3 lands the dispatch but
+   keeps using the existing non-deterministic `next_id()` /
+   `Utc::now()` paths inside `RocksMetaStore`. M3.4 then adds
+   `assigned_id: Option<u64>` and `assigned_now: Option<i64>` to
+   the relevant variants and changes the trait methods to accept
+   them. **Do not flip `CUBESTORE_HA_MODE=raft` (M3.5) until
+   M3.4 is in.** Auditing grep: 5 `Utc::now()` calls in
+   `metastore/mod.rs` (lines 2597, 3194, 3331, 4147 + one
+   `SystemTime::now` for cache TTL). `next_id` calls are inside
+   the per-table `RocksTable::insert` impl — N+1 grep needed.
+
+5. **Test strategy.** Two layers:
+   - per-variant unit tests in `rocks_apply.rs::tests` using a
+     real temp `RocksMetaStore` instance (no Raft) to verify
+     the dispatch produces the right side effects;
+   - end-to-end test in `state_machine::tests` that boots a
+     single-node Raft on top of `RocksMetaStoreApply` and
+     proves the propose→apply→trait-return path is wired right.
