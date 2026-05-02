@@ -44,7 +44,9 @@ use crate::metastore::job::{Job, JobStatus};
 use crate::metastore::multi_index::MultiPartition;
 use crate::metastore::replay_handle::SeqPointer;
 use crate::metastore::source::SourceCredentials;
-use crate::metastore::{Column, IndexDef, MetaStore, Partition, RocksMetaStore};
+use crate::metastore::table::StreamOffset;
+use crate::metastore::{Column, ImportFormat, IndexDef, MetaStore, Partition, RocksMetaStore};
+use chrono::{DateTime, TimeZone, Utc};
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult};
 use crate::raft::state_machine::Apply;
 use crate::table::Row;
@@ -436,18 +438,76 @@ impl Apply for RocksMetaStoreApply {
                 Ok(MetaCommandResult::Unit)
             }
 
-            // ---- Deferred to M3.3.b ---------------------------------------
-            // These variants are present in the wire format but not yet
-            // dispatched. Returning an error makes a misconfigured caller
-            // fail loud — silently dropping a write would be a determinism
-            // bug across replicas.
-            MetaCommand::CreateTable { .. } => Err(not_yet_implemented(
-                "CreateTable",
-                "Cat D mega-args; M3.3.b will land structured fields",
-            )),
+            // ---- Cat D: CreateTable structured form (M3.3.b.3) -------------
+            MetaCommand::CreateTable {
+                schema_name,
+                table_name,
+                columns_blob,
+                locations,
+                import_format_blob,
+                indexes_blob,
+                is_ready,
+                build_range_end_millis,
+                seal_at_millis,
+                select_statement,
+                source_columns_blob,
+                stream_offset_blob,
+                unique_key_column_names,
+                aggregates,
+                partition_split_threshold,
+                trace_obj,
+                drop_if_exists,
+                extension,
+            } => {
+                let columns: Vec<Column> = decode_typed_blob(&columns_blob, "columns_blob")?;
+                let import_format: Option<ImportFormat> = decode_optional_blob(
+                    import_format_blob.as_deref(),
+                    "import_format_blob",
+                )?;
+                let indexes: Vec<IndexDef> = decode_typed_blob(&indexes_blob, "indexes_blob")?;
+                let source_columns: Option<Vec<Column>> = decode_optional_blob(
+                    source_columns_blob.as_deref(),
+                    "source_columns_blob",
+                )?;
+                let stream_offset: Option<StreamOffset> = decode_optional_blob(
+                    stream_offset_blob.as_deref(),
+                    "stream_offset_blob",
+                )?;
+                let build_range_end = decode_optional_millis(
+                    build_range_end_millis,
+                    "build_range_end_millis",
+                )?;
+                let seal_at = decode_optional_millis(seal_at_millis, "seal_at_millis")?;
+                let row = self
+                    .store
+                    .create_table(
+                        schema_name,
+                        table_name,
+                        columns,
+                        locations,
+                        import_format,
+                        indexes,
+                        is_ready,
+                        build_range_end,
+                        seal_at,
+                        select_statement,
+                        source_columns,
+                        stream_offset,
+                        unique_key_column_names,
+                        aggregates,
+                        partition_split_threshold,
+                        trace_obj,
+                        drop_if_exists,
+                        extension,
+                    )
+                    .await?;
+                wrap_id_row(IdRowKind::Table, &row)
+            }
+
+            // ---- Deferred to M3.3.b/c -------------------------------------
             MetaCommand::SwapActivePartitions { .. } => Err(not_yet_implemented(
                 "SwapActivePartitions",
-                "Cat E compound atomic swap; M3.3.b",
+                "Cat E compound atomic swap with Row payloads; M3.3.b.4",
             )),
             MetaCommand::AcquirePartitionedLock { .. } => Err(not_yet_implemented(
                 "AcquirePartitionedLock",
@@ -519,6 +579,26 @@ fn decode_optional_blob<T: DeserializeOwned>(
     match bytes {
         None => Ok(None),
         Some(b) => decode_typed_blob(b, field).map(Some),
+    }
+}
+
+/// Decode `Option<i64>` ms-since-epoch into `Option<DateTime<Utc>>`.
+/// Out-of-range timestamps (chrono can't represent them) error rather
+/// than silently wrap — that surfaces a leader/follower wire bug.
+fn decode_optional_millis(
+    ms: Option<i64>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, CubeError> {
+    match ms {
+        None => Ok(None),
+        Some(v) => match Utc.timestamp_millis_opt(v).single() {
+            Some(dt) => Ok(Some(dt)),
+            None => Err(CubeError::internal(format!(
+                "MetaCommand apply: {} = {} ms-since-epoch is out of \
+                 representable DateTime<Utc> range",
+                field, v
+            ))),
+        },
     }
 }
 
@@ -652,18 +732,16 @@ mod tests {
         let (store, sp, rp) = setup_store(test_name);
         let apply = RocksMetaStoreApply::new(store.clone());
 
-        // CreateTable is M3.3.b — must error, not silently succeed.
+        // SwapActivePartitions is still deferred (Cat E with Row payloads).
         let err = apply
-            .apply(MetaCommand::CreateTable {
-                schema_name: "s".into(),
-                table_name: "t".into(),
+            .apply(MetaCommand::SwapActivePartitions {
                 payload_version: 1,
                 payload: vec![1, 2, 3],
             })
             .await
-            .expect_err("CreateTable must error in M3.3.a");
+            .expect_err("SwapActivePartitions must error until M3.3.b.4");
         assert!(
-            err.message.contains("CreateTable"),
+            err.message.contains("SwapActivePartitions"),
             "error must name the variant: {}",
             err.message
         );

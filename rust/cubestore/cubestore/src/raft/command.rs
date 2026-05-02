@@ -113,15 +113,39 @@ pub enum MetaCommand {
 
     // ---- Tables ----------------------------------------------------------
     /// `MetaStore::create_table` — the single most parameter-heavy method
-    /// in the trait. We treat the whole call as opaque-bytes here in M1;
-    /// M3 will replace this with a structured payload mirroring the trait
-    /// arguments exactly. The wire stays stable because we tag the body
-    /// with `payload_version`.
+    /// in the trait (16 args). M1 shipped it as opaque bytes; M3.3.b.3
+    /// replaces that with a fully structured payload that mirrors the
+    /// trait arguments. Complex types from the metastore (`Vec<Column>`,
+    /// `Vec<IndexDef>`, `ImportFormat`, `StreamOffset`) ship as flex
+    /// blobs because the raft module deliberately doesn't import
+    /// metastore types. Times encode as `Option<i64>` ms-since-epoch.
     CreateTable {
         schema_name: String,
         table_name: String,
-        payload_version: u16,
-        payload: Vec<u8>,
+        /// flex-encoded `Vec<Column>`.
+        columns_blob: Vec<u8>,
+        locations: Option<Vec<String>>,
+        /// flex-encoded `Option<ImportFormat>`. Stored as a blob even
+        /// though `ImportFormat` is a small enum, to avoid leaking the
+        /// metastore type into the raft wire schema.
+        import_format_blob: Option<Vec<u8>>,
+        /// flex-encoded `Vec<IndexDef>`.
+        indexes_blob: Vec<u8>,
+        is_ready: bool,
+        /// `Option<DateTime<Utc>>` as ms-since-epoch.
+        build_range_end_millis: Option<i64>,
+        seal_at_millis: Option<i64>,
+        select_statement: Option<String>,
+        /// flex-encoded `Option<Vec<Column>>`.
+        source_columns_blob: Option<Vec<u8>>,
+        /// flex-encoded `Option<StreamOffset>`.
+        stream_offset_blob: Option<Vec<u8>>,
+        unique_key_column_names: Option<Vec<String>>,
+        aggregates: Option<Vec<(String, String)>>,
+        partition_split_threshold: Option<u64>,
+        trace_obj: Option<String>,
+        drop_if_exists: bool,
+        extension: Option<String>,
     },
     DropTable {
         table_id: u64,
@@ -631,18 +655,48 @@ mod tests {
 
     #[test]
     fn create_table_round_trip() {
+        // Maximum-arg form: every Option set to Some, every Vec
+        // populated. Catches any field mis-ordering during encode.
         round_trip(MetaCommand::CreateTable {
             schema_name: "public".into(),
             table_name: "orders".into(),
-            payload_version: 1,
-            payload: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            columns_blob: vec![0xC0; 64],
+            locations: Some(vec!["s3://a/x.csv".into(), "s3://a/y.csv".into()]),
+            import_format_blob: Some(vec![0xF1; 8]),
+            indexes_blob: vec![0xF2; 32],
+            is_ready: true,
+            build_range_end_millis: Some(1_700_000_000_000),
+            seal_at_millis: Some(1_800_000_000_000),
+            select_statement: Some("SELECT * FROM raw".into()),
+            source_columns_blob: Some(vec![0xF3; 16]),
+            stream_offset_blob: Some(vec![0xF4; 4]),
+            unique_key_column_names: Some(vec!["id".into(), "ts".into()]),
+            aggregates: Some(vec![("count".into(), "*".into()), ("sum".into(), "amt".into())]),
+            partition_split_threshold: Some(1 << 30),
+            trace_obj: Some("trace-blob".into()),
+            drop_if_exists: false,
+            extension: Some("parquet".into()),
         });
-        // empty payload is legal (M3 might use it for default values)
+        // Minimum-arg form: every Option None, every Vec empty.
         round_trip(MetaCommand::CreateTable {
-            schema_name: "public".into(),
-            table_name: "empty".into(),
-            payload_version: 1,
-            payload: vec![],
+            schema_name: String::new(),
+            table_name: String::new(),
+            columns_blob: vec![],
+            locations: None,
+            import_format_blob: None,
+            indexes_blob: vec![],
+            is_ready: false,
+            build_range_end_millis: None,
+            seal_at_millis: None,
+            select_statement: None,
+            source_columns_blob: None,
+            stream_offset_blob: None,
+            unique_key_column_names: None,
+            aggregates: None,
+            partition_split_threshold: None,
+            trace_obj: None,
+            drop_if_exists: false,
+            extension: None,
         });
     }
 
@@ -705,8 +759,22 @@ mod tests {
                 MetaCommand::CreateTable {
                     schema_name: "s1".into(),
                     table_name: "t1".into(),
-                    payload_version: 1,
-                    payload: vec![9, 9, 9],
+                    columns_blob: vec![9, 9, 9],
+                    locations: None,
+                    import_format_blob: None,
+                    indexes_blob: vec![],
+                    is_ready: true,
+                    build_range_end_millis: None,
+                    seal_at_millis: None,
+                    select_statement: None,
+                    source_columns_blob: None,
+                    stream_offset_blob: None,
+                    unique_key_column_names: None,
+                    aggregates: None,
+                    partition_split_threshold: None,
+                    trace_obj: None,
+                    drop_if_exists: false,
+                    extension: None,
                 },
                 MetaCommand::DropTable { table_id: 1 },
             ],
@@ -1108,8 +1176,22 @@ mod tests {
         let cmd = MetaCommand::CreateTable {
             schema_name: "s".into(),
             table_name: "t".into(),
-            payload_version: 1,
-            payload: vec![0x42; 1024],
+            columns_blob: vec![0x42; 1024],
+            locations: None,
+            import_format_blob: None,
+            indexes_blob: vec![],
+            is_ready: true,
+            build_range_end_millis: None,
+            seal_at_millis: None,
+            select_statement: None,
+            source_columns_blob: None,
+            stream_offset_blob: None,
+            unique_key_column_names: None,
+            aggregates: None,
+            partition_split_threshold: None,
+            trace_obj: None,
+            drop_if_exists: false,
+            extension: None,
         };
         let bytes = cmd.encode().unwrap();
         assert!(
