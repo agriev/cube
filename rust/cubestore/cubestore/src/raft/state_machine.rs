@@ -37,6 +37,7 @@
 use crate::raft::command::{MetaCommand, MetaCommandCodecError, MetaCommandResult};
 use crate::raft::storage::{RaftStorage, RaftStorageError, SharedRaftStorage};
 use crate::CubeError;
+use async_trait::async_trait;
 use raft::eraftpb::{ConfState, Entry, EntryType, Message};
 use raft::{Config, RawNode};
 use slog::{o, Drain};
@@ -46,12 +47,20 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// A pluggable side-effect that the Raft apply loop runs for every
-/// committed `MetaCommand`. M2 used a test implementation; M3.3 will
-/// provide one backed by `RocksMetaStore`.
+/// committed `MetaCommand`. M3.3 lands `RocksMetaStoreApply` as the
+/// production impl; tests use lighter in-memory variants.
 ///
 /// Implementations must be **deterministic** — every replica that
 /// applies the same sequence of `MetaCommand`s must reach the same
 /// observable state, byte-for-byte. See `docs/ha/PLAN.md` risk #1.
+///
+/// The trait is async because the real `MetaStore` write methods
+/// are async (they queue through `RocksStore::write_operation` onto
+/// a single rw-loop). The Raft apply task is a tokio task — making
+/// this async means each apply awaits the rw-loop in-line; the next
+/// committed entry is applied only after the previous one has been
+/// durably written. That serialization is what gives us deterministic
+/// replay across replicas.
 ///
 /// The return value mirrors the shape of the underlying `MetaStore`
 /// write method via `MetaCommandResult`:
@@ -63,8 +72,9 @@ use tokio::sync::{mpsc, oneshot};
 /// The wrapper-style `RaftMetaStore: MetaStore` impl reads the
 /// matching variant after `propose(...).await?` and decodes the
 /// payload back into the trait's typed return.
+#[async_trait]
 pub trait Apply: Send + Sync + 'static {
-    fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError>;
+    async fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError>;
 }
 
 /// Errors specific to the Raft layer (separate from the codec errors
@@ -203,13 +213,13 @@ async fn run_node<A: Apply>(
             e
         );
     }
-    drive_ready(&mut raw, &storage, &apply, &mut pending);
+    drive_ready(&mut raw, &storage, &apply, &mut pending).await;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 raw.tick();
-                drive_ready(&mut raw, &storage, &apply, &mut pending);
+                drive_ready(&mut raw, &storage, &apply, &mut pending).await;
             }
             maybe = proposals.recv() => {
                 match maybe {
@@ -231,7 +241,7 @@ async fn run_node<A: Apply>(
                             continue;
                         }
                         pending.insert(next_index, p.respond_to);
-                        drive_ready(&mut raw, &storage, &apply, &mut pending);
+                        drive_ready(&mut raw, &storage, &apply, &mut pending).await;
                     }
                     None => break,
                 }
@@ -240,7 +250,7 @@ async fn run_node<A: Apply>(
     }
 }
 
-fn drive_ready<A: Apply>(
+async fn drive_ready<A: Apply>(
     raw: &mut RawNode<SharedRaftStorage>,
     storage: &SharedRaftStorage,
     apply: &Arc<A>,
@@ -276,7 +286,7 @@ fn drive_ready<A: Apply>(
     let _outbound: Vec<Message> = ready.take_messages();
 
     // 4. Apply committed entries.
-    let highest_applied = apply_committed(ready.committed_entries(), apply, pending);
+    let highest_applied = apply_committed(ready.committed_entries(), apply, pending).await;
     if let Some(idx) = highest_applied {
         let _ = storage.set_applied_index(idx); // best-effort; M5 uses for snapshots
     }
@@ -284,7 +294,7 @@ fn drive_ready<A: Apply>(
     // 5. Tell raft we're done with this Ready.
     let mut light_ready = raw.advance(ready);
 
-    let highest_applied2 = apply_committed(light_ready.committed_entries(), apply, pending);
+    let highest_applied2 = apply_committed(light_ready.committed_entries(), apply, pending).await;
     if let Some(idx) = highest_applied2 {
         let _ = storage.set_applied_index(idx);
     }
@@ -294,8 +304,10 @@ fn drive_ready<A: Apply>(
 
 /// Apply each committed entry, return the highest index actually
 /// applied (caller persists this to `applied_index` for restart-time
-/// recovery).
-fn apply_committed<A: Apply>(
+/// recovery). Async because `Apply::apply` is async — the apply of
+/// entry N awaits before entry N+1 starts, which is exactly the
+/// determinism guarantee we want.
+async fn apply_committed<A: Apply>(
     entries: &[Entry],
     apply: &Arc<A>,
     pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
@@ -311,11 +323,13 @@ fn apply_committed<A: Apply>(
         // field (rust-protobuf 2.x style), not a method.
         match ent.entry_type {
             EntryType::EntryNormal => {
-                let result = MetaCommand::decode(&ent.data)
-                    .map_err(|e| {
-                        CubeError::internal(format!("decode at index {}: {}", ent.index, e))
-                    })
-                    .and_then(|cmd| apply.apply(cmd));
+                let result = match MetaCommand::decode(&ent.data) {
+                    Ok(cmd) => apply.apply(cmd).await,
+                    Err(e) => Err(CubeError::internal(format!(
+                        "decode at index {}: {}",
+                        ent.index, e
+                    ))),
+                };
                 if let Some(tx) = pending.remove(&ent.index) {
                     let _ = tx.send(result);
                 }
@@ -368,8 +382,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Apply for RecordingApply {
-        fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
+        async fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
             self.seen.lock().unwrap().push(cmd);
             Ok(MetaCommandResult::Unit)
         }
@@ -405,8 +420,9 @@ mod tests {
     /// per command — exercises the M3.2 typed return path end-to-end
     /// (encode → propose → apply → decode in caller).
     struct TypedReturnApply;
+    #[async_trait]
     impl Apply for TypedReturnApply {
-        fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
+        async fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
             use crate::raft::command::IdRowKind;
             // Pretend rows: just `(id, name)` tuples. The wire layer
             // doesn't care about the actual `IdRow<T>` type, only that
@@ -564,8 +580,9 @@ mod tests {
             }
         }
     }
+    #[async_trait]
     impl Apply for HashMapApply {
-        fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
+        async fn apply(&self, cmd: MetaCommand) -> Result<MetaCommandResult, CubeError> {
             if let MetaCommand::CreateSchema {
                 schema_name,
                 if_not_exists,
@@ -652,5 +669,69 @@ mod tests {
             "log should contain at least 3 proposed entries; got last_index={}",
             reopened.last_index_internal_for_test()
         );
+    }
+
+    /// M3.3 e2e — propose `CreateSchema` through real Raft against a
+    /// real `RocksMetaStoreApply` and assert the schema actually
+    /// persists in the underlying RocksMetaStore. This is the wiring
+    /// proof for M3.3.a: encode → Raft commit → apply dispatch →
+    /// trait method → result decoded back into `IdRow<Schema>`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raft_dispatches_create_schema_to_rocks_meta_store() {
+        use crate::config::Config;
+        use crate::metastore::{
+            BaseRocksStoreFs, IdRow, MetaStore, RocksMetaStore, Schema,
+        };
+        use crate::raft::command::IdRowKind;
+        use crate::raft::rocks_apply::RocksMetaStoreApply;
+        use crate::remotefs::LocalDirRemoteFs;
+        use std::env;
+        use std::fs;
+
+        let test_name = "m3_3_e2e_create_schema";
+        let cwd = env::current_dir().unwrap();
+        let store_path = cwd.join(format!("{}-local", test_name));
+        let remote_store_path = cwd.join(format!("{}-remote", test_name));
+        let _ = fs::remove_dir_all(&store_path);
+        let _ = fs::remove_dir_all(&remote_store_path);
+        let raft_dir = TempDir::new().unwrap();
+
+        let config = Config::test(test_name);
+        let remote_fs =
+            LocalDirRemoteFs::new(Some(remote_store_path.clone()), store_path.clone());
+        let rocks = RocksMetaStore::new(
+            store_path.join("metastore").as_path(),
+            BaseRocksStoreFs::new_for_metastore(remote_fs.clone(), config.config_obj()),
+            config.config_obj(),
+        )
+        .expect("RocksMetaStore::new");
+        let apply = Arc::new(RocksMetaStoreApply::new(rocks.clone()));
+        let raft = RaftMetaStore::start_single_node(raft_dir.path(), 1, apply)
+            .expect("boot single-node raft");
+
+        // Settle election.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let result = raft
+            .propose(MetaCommand::CreateSchema {
+                schema_name: "e2e".into(),
+                if_not_exists: false,
+            })
+            .await
+            .expect("propose CreateSchema");
+
+        // Result decodes back into a typed IdRow<Schema> via M3.2 helpers.
+        let row: IdRow<Schema> = result
+            .into_id_row(IdRowKind::Schema)
+            .expect("decode IdRow<Schema>");
+        assert_eq!(row.get_row().get_name(), "e2e");
+
+        // The underlying RocksMetaStore actually has the row.
+        let listed = rocks.get_schemas().await.expect("get_schemas");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].get_row().get_name(), "e2e");
+
+        let _ = fs::remove_dir_all(&store_path);
+        let _ = fs::remove_dir_all(&remote_store_path);
     }
 }

@@ -13,16 +13,26 @@
 //!   `RocksMetaStore` and routes writes through Raft.
 //! - [`storage`] — `RaftStorage`, the `raft::Storage` impl backed by a
 //!   dedicated RocksDB instance under `<data_dir>/raft-log/`.
+//! - [`rocks_apply`] — `RocksMetaStoreApply`, the `Apply` impl that
+//!   dispatches each `MetaCommand` to the matching `RocksMetaStore`
+//!   write method. This is the production wiring; tests use lighter
+//!   in-memory `Apply` impls for round-trip coverage.
 //! - [`transport`] — wire-format and `cuberpc`-based message shipping
 //!   between Raft peers.
 //!
-//! Milestone status (M1: scaffolding only):
-//! - [x] `MetaCommand` enum with representative variants and round-trip tests
-//! - [ ] All 86 `MetaStore` write methods enumerated (M3)
-//! - [ ] Single-node Raft state machine (M2)
-//! - [ ] 3-node clustering / leader election (M4)
+//! Milestone status:
+//! - [x] M1 — `MetaCommand` enum with representative variants
+//! - [x] M2 — single-node Raft state machine + persistent storage
+//! - [x] M3.1 — Cat A/B variants (~28 of 86 write methods)
+//! - [x] M3.2 — `MetaCommandResult` typed returns
+//! - [ ] M3.3 — `RocksMetaStoreApply` dispatch (in progress)
+//! - [ ] M3.4 — Determinism fix: leader-assigned IDs / timestamps
+//! - [ ] M3.5 — Config wiring: `CUBESTORE_HA_MODE` boot path
+//! - [ ] M3.6 — `cubestore-sql-tests` passing under HA mode
+//! - [ ] M4 — Multi-node clustering + leader election
 
 pub mod command;
+pub mod rocks_apply;
 pub mod state_machine;
 pub mod storage;
 pub mod transport;

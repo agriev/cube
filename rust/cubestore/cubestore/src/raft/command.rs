@@ -165,9 +165,6 @@ pub enum MetaCommand {
     DeleteSchemaById {
         schema_id: u64,
     },
-    DeletePartitionById {
-        partition_id: u64,
-    },
     MarkPartitionWarmedUp {
         partition_id: u64,
     },
@@ -177,6 +174,9 @@ pub enum MetaCommand {
     DeleteChunk {
         chunk_id: u64,
     },
+    DeleteChunksWithoutChecks {
+        chunk_ids: Vec<u64>,
+    },
     DeleteWal {
         wal_id: u64,
     },
@@ -184,9 +184,6 @@ pub enum MetaCommand {
         job_id: u64,
     },
     DeleteSource {
-        id: u64,
-    },
-    DeleteReplayHandle {
         id: u64,
     },
 
@@ -593,16 +590,18 @@ mod tests {
     #[test]
     fn cat_a_single_id_deletes_round_trip() {
         round_trip(MetaCommand::DeleteSchemaById { schema_id: 1 });
-        round_trip(MetaCommand::DeletePartitionById { partition_id: 999 });
         round_trip(MetaCommand::MarkPartitionWarmedUp { partition_id: 0 });
         round_trip(MetaCommand::DeleteMiddleManPartition {
             partition_id: u64::MAX,
         });
         round_trip(MetaCommand::DeleteChunk { chunk_id: 7 });
+        round_trip(MetaCommand::DeleteChunksWithoutChecks {
+            chunk_ids: vec![1, 2, 3, 4, 5],
+        });
+        round_trip(MetaCommand::DeleteChunksWithoutChecks { chunk_ids: vec![] });
         round_trip(MetaCommand::DeleteWal { wal_id: 42 });
         round_trip(MetaCommand::DeleteJob { job_id: 100 });
         round_trip(MetaCommand::DeleteSource { id: 5 });
-        round_trip(MetaCommand::DeleteReplayHandle { id: 99 });
     }
 
     #[test]
