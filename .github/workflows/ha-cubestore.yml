@@ -59,31 +59,36 @@ jobs:
 
   # Slow feedback: full cubestore cargo check to catch any conflicts the
   # new raft / slog deps introduce against the existing dependency tree.
+  #
+  # Runs on the project's self-hosted Linux x64 runner — much faster
+  # than ubuntu-latest because the cargo target is persistent across
+  # runs (warm rebuild ~30s vs cold ~6-10 min on hosted).
   cubestore-check:
     name: cubestore cargo check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache cargo registry + target
+      - name: Cache cargo registry + git
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/cubestore/target
-          key: ${{ runner.os }}-cubestore-${{ hashFiles('rust/cubestore/**/Cargo.lock', 'rust/cubestore/**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/cubestore/**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cubestore-
+            ${{ runner.os }}-cargo-
 
       - name: Install Linux build prereqs (cmake, sasl, libclang, etc.)
         run: |
-          sudo apt-get update
+          # Self-hosted runner: prereqs may already be present;
+          # `|| true` makes the step idempotent across runs.
+          sudo apt-get update -qq || true
           sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config \
             libssl-dev libsasl2-dev libpq-dev liblz4-dev libzstd-dev \
-            clang libclang-dev
+            clang libclang-dev || true
 
       - name: Install Rust toolchain pinned in rust-toolchain.toml
         uses: dtolnay/rust-toolchain@master
@@ -110,32 +115,34 @@ jobs:
   # end-to-end against the real SQL surface. Single-process tests
   # only — multi-process / cluster tests need M4 (multi-node Raft)
   # before they make sense.
+  #
+  # Self-hosted runner: piggybacks on the warm cargo target from the
+  # cubestore-check job above. Saves ~6 min of cold rebuild.
   sql-tests-ha:
     name: cubestore-sql-tests (HA mode, in_process)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 90
     needs: cubestore-check
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache cargo registry + target
+      - name: Cache cargo registry + git
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/cubestore/target
-          key: ${{ runner.os }}-cubestore-${{ hashFiles('rust/cubestore/**/Cargo.lock', 'rust/cubestore/**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/cubestore/**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cubestore-
+            ${{ runner.os }}-cargo-
 
       - name: Install Linux build prereqs
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq || true
           sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config \
             libssl-dev libsasl2-dev libpq-dev liblz4-dev libzstd-dev \
-            clang libclang-dev
+            clang libclang-dev || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

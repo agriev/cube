@@ -1299,4 +1299,62 @@ mod tests {
 
         cleanup(&sp, &rp);
     }
+
+    /// Job lifecycle through the wrapper:
+    /// `add_job` → `start_processing_job` → `update_heart_beat`
+    /// → `delete_job`. Exercises the
+    /// `MetaCommandResult::OptionalIdRow` round-trip (returned by
+    /// `add_job` and `start_processing_job`) plus the M3.4.c/d
+    /// leader-stamped `now` plumbing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_lifecycle_via_metastore_trait() {
+        use crate::metastore::job::{Job, JobType};
+        use crate::metastore::rocks_store::RowKey;
+        use crate::metastore::TableId;
+
+        let (wrapper, sp, rp, _raft_dir) = setup_wrapper("raft_meta_store_job_lifecycle");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // add_job — returns Some(IdRow<Job>) on success.
+        let job = Job::new(
+            RowKey::Table(TableId::Partitions, 1),
+            JobType::PartitionCompaction,
+            "node1".to_string(),
+        );
+        let added = MetaStore::add_job(&*wrapper, job)
+            .await
+            .expect("add_job");
+        let added = added.expect("add_job must produce a row");
+        let job_id = added.get_id();
+
+        // start_processing_job — pulls the job we just added.
+        let picked = MetaStore::start_processing_job(&*wrapper, "node1".into(), false)
+            .await
+            .expect("start_processing_job");
+        let picked = picked.expect("a queued job must be available");
+        assert_eq!(picked.get_id(), job_id);
+
+        // update_heart_beat — refreshes `last_heart_beat`.
+        let beat = MetaStore::update_heart_beat(&*wrapper, job_id)
+            .await
+            .expect("update_heart_beat");
+        assert!(
+            beat.get_row().last_heart_beat() >= picked.get_row().last_heart_beat(),
+            "heart_beat must be monotonic"
+        );
+
+        // delete_job — removes and returns the row.
+        let deleted = MetaStore::delete_job(&*wrapper, job_id)
+            .await
+            .expect("delete_job");
+        assert_eq!(deleted.get_id(), job_id);
+
+        // all_jobs — empty after delete.
+        let remaining = MetaStore::all_jobs(&*wrapper)
+            .await
+            .expect("all_jobs");
+        assert!(remaining.is_empty(), "queue must be empty after delete");
+
+        cleanup(&sp, &rp);
+    }
 }
