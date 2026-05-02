@@ -1678,6 +1678,53 @@ impl RocksMetaStore {
         .await
     }
 
+    /// HA-determinism variant of `create_replay_handle` — takes an
+    /// explicit `now` so the replay handle's `created_at` is the
+    /// leader's wall-clock, not each replica's. The trait method
+    /// delegates here with `Utc::now()`. M3.4.b.1.
+    pub async fn create_replay_handle_with_now(
+        &self,
+        table_id: u64,
+        location_index: usize,
+        seq_pointer: crate::metastore::replay_handle::SeqPointer,
+        now: DateTime<Utc>,
+    ) -> Result<IdRow<crate::metastore::replay_handle::ReplayHandle>, CubeError> {
+        self.write_operation("create_replay_handle", move |db_ref, batch_pipe| {
+            let tables_table = TableRocksTable::new(db_ref.clone());
+            let table = tables_table.get_row_or_not_found(table_id)?;
+            let handle = crate::metastore::replay_handle::ReplayHandle::new_pure(
+                &table,
+                location_index,
+                seq_pointer,
+                now,
+            )?;
+            Ok(ReplayHandleRocksTable::new(db_ref.clone()).insert(handle, batch_pipe)?)
+        })
+        .await
+    }
+
+    /// HA-determinism variant of `create_replay_handle_from_seq_pointers`.
+    /// M3.4.b.1.
+    pub async fn create_replay_handle_from_seq_pointers_with_now(
+        &self,
+        table_id: u64,
+        seq_pointers: Option<Vec<Option<crate::metastore::replay_handle::SeqPointer>>>,
+        now: DateTime<Utc>,
+    ) -> Result<IdRow<crate::metastore::replay_handle::ReplayHandle>, CubeError> {
+        self.write_operation(
+            "create_replay_handle_from_seq_pointers",
+            move |db_ref, batch_pipe| {
+                let handle = crate::metastore::replay_handle::ReplayHandle::new_from_seq_pointers_pure(
+                    table_id,
+                    seq_pointers,
+                    now,
+                );
+                Ok(ReplayHandleRocksTable::new(db_ref.clone()).insert(handle, batch_pipe)?)
+            },
+        )
+        .await
+    }
+
     fn add_index(
         batch_pipe: &mut BatchPipe<'_, RocksMetaStore>,
         rocks_index: &IndexRocksTable,
@@ -4350,13 +4397,10 @@ impl MetaStore for RocksMetaStore {
         location_index: usize,
         seq_pointer: SeqPointer,
     ) -> Result<IdRow<ReplayHandle>, CubeError> {
-        self.write_operation("create_replay_handle", move |db_ref, batch_pipe| {
-            let tables_table = TableRocksTable::new(db_ref.clone());
-            let table = tables_table.get_row_or_not_found(table_id)?;
-            let handle = ReplayHandle::new(&table, location_index, seq_pointer)?;
-            Ok(ReplayHandleRocksTable::new(db_ref.clone()).insert(handle, batch_pipe)?)
-        })
-        .await
+        // M3.4.b.1: delegate to the inherent _with_now variant so HA
+        // mode can share the same body with a leader-stamped `now`.
+        self.create_replay_handle_with_now(table_id, location_index, seq_pointer, Utc::now())
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self, seq_pointers))]
@@ -4365,14 +4409,8 @@ impl MetaStore for RocksMetaStore {
         table_id: u64,
         seq_pointers: Option<Vec<Option<SeqPointer>>>,
     ) -> Result<IdRow<ReplayHandle>, CubeError> {
-        self.write_operation(
-            "create_replay_handle_from_seq_pointers",
-            move |db_ref, batch_pipe| {
-                let handle = ReplayHandle::new_from_seq_pointers(table_id, seq_pointers);
-                Ok(ReplayHandleRocksTable::new(db_ref.clone()).insert(handle, batch_pipe)?)
-            },
-        )
-        .await
+        self.create_replay_handle_from_seq_pointers_with_now(table_id, seq_pointers, Utc::now())
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

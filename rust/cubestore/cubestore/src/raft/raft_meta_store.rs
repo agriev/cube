@@ -1043,11 +1043,15 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<IdRow<ReplayHandle>, CubeError> {
         let seq_pointer_blob =
             Self::encode_blob("create_replay_handle", "seq_pointer", &seq_pointer)?;
+        // M3.4.b.1: stamp `now` on the leader and ship it to followers
+        // so each replica's ReplayHandle::created_at is identical.
+        let assigned_now_millis = Utc::now().timestamp_millis();
         self.raft
             .propose(MetaCommand::CreateReplayHandle {
                 table_id,
                 location_index: location_index as u64,
                 seq_pointer_blob,
+                assigned_now_millis,
             })
             .await?
             .into_id_row(IdRowKind::ReplayHandle)
@@ -1063,10 +1067,12 @@ impl MetaStore for RaftMetaStore {
             "seq_pointers",
             &seq_pointer,
         )?;
+        let assigned_now_millis = Utc::now().timestamp_millis();
         self.raft
             .propose(MetaCommand::CreateReplayHandleFromSeqPointers {
                 table_id,
                 seq_pointers_blob,
+                assigned_now_millis,
             })
             .await?
             .into_id_row(IdRowKind::ReplayHandle)

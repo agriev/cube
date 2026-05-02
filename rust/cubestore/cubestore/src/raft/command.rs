@@ -295,11 +295,17 @@ pub enum MetaCommand {
         location_index: u64,
         /// flex-encoded `SeqPointer`.
         seq_pointer_blob: Vec<u8>,
+        /// M3.4.b.1: leader's `Utc::now().timestamp_millis()` so the
+        /// new ReplayHandle's `created_at` is identical on every
+        /// replica.
+        assigned_now_millis: i64,
     },
     CreateReplayHandleFromSeqPointers {
         table_id: u64,
         /// flex-encoded `Option<Vec<Option<SeqPointer>>>`.
         seq_pointers_blob: Vec<u8>,
+        /// M3.4.b.1: leader-stamped `created_at`.
+        assigned_now_millis: i64,
     },
 
     // ---- Cat A: simple uploads/seals (M3.3.b.2) -------------------------
@@ -1007,16 +1013,19 @@ mod tests {
             table_id: 42,
             location_index: 0,
             seq_pointer_blob: vec![0xBB; 32],
+            assigned_now_millis: 1_700_000_000_000,
         });
         round_trip(MetaCommand::CreateReplayHandle {
             table_id: u64::MAX,
             location_index: u64::MAX,
             seq_pointer_blob: vec![],
+            assigned_now_millis: i64::MIN,
         });
 
         round_trip(MetaCommand::CreateReplayHandleFromSeqPointers {
             table_id: 99,
             seq_pointers_blob: vec![0xDD; 192],
+            assigned_now_millis: 0,
         });
     }
 

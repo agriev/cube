@@ -221,6 +221,7 @@ impl Apply for RocksMetaStoreApply {
                 table_id,
                 location_index,
                 seq_pointer_blob,
+                assigned_now_millis,
             } => {
                 let seq: SeqPointer = decode_typed_blob(&seq_pointer_blob, "seq_pointer_blob")?;
                 let location_usize = usize::try_from(location_index).map_err(|_| {
@@ -229,21 +230,28 @@ impl Apply for RocksMetaStoreApply {
                         location_index
                     ))
                 })?;
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
                 let row = self
                     .store
-                    .create_replay_handle(table_id, location_usize, seq)
+                    .create_replay_handle_with_now(table_id, location_usize, seq, now)
                     .await?;
                 wrap_id_row(IdRowKind::ReplayHandle, &row)
             }
             MetaCommand::CreateReplayHandleFromSeqPointers {
                 table_id,
                 seq_pointers_blob,
+                assigned_now_millis,
             } => {
                 let seq_pointers: Option<Vec<Option<SeqPointer>>> =
                     decode_typed_blob(&seq_pointers_blob, "seq_pointers_blob")?;
+                let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
                 let row = self
                     .store
-                    .create_replay_handle_from_seq_pointers(table_id, seq_pointers)
+                    .create_replay_handle_from_seq_pointers_with_now(
+                        table_id,
+                        seq_pointers,
+                        now,
+                    )
                     .await?;
                 wrap_id_row(IdRowKind::ReplayHandle, &row)
             }
@@ -605,6 +613,18 @@ fn decode_optional_millis(
             ))),
         },
     }
+}
+
+/// Decode a required `i64` ms-since-epoch into `DateTime<Utc>`. Used
+/// by M3.4.b.1 variants that carry a leader-stamped `now`.
+fn decode_required_millis(ms: i64, field: &str) -> Result<DateTime<Utc>, CubeError> {
+    Utc.timestamp_millis_opt(ms).single().ok_or_else(|| {
+        CubeError::internal(format!(
+            "MetaCommand apply: {} = {} ms-since-epoch is out of \
+             representable DateTime<Utc> range",
+            field, ms
+        ))
+    })
 }
 
 fn not_yet_implemented(variant: &str, reason: &str) -> CubeError {

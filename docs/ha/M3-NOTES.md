@@ -99,7 +99,8 @@ heartbeat / time-based ones.
 | **M3.4** | Determinism fix: leader-resolved `Utc::now`/random in row constructors | in progress | 3 |
 | ↳ M3.4.a | Pattern + `CreateChunk` (Chunk::new_pure + insert_chunk_pre_built + wrapper + dispatch) | ✅ done (`m3.4.a-complete`) | 1 |
 | ↳ M3.4.b | `Table::new_pure` + `ReplayHandle::new_pure` constructors | in progress | 1 |
-| ↳ M3.4.b.1 | Plumb leader-stamped now through `create_table`, `create_replay_handle`, `create_replay_handle_from_seq_pointers` apply paths | pending | 1 |
+| ↳ M3.4.b.1 | Plumb leader-stamped now through `create_replay_handle`, `create_replay_handle_from_seq_pointers` apply paths (ReplayHandle subset) | in progress | 1 |
+| ↳ M3.4.b.2 | Same for `create_table` (235-line body refactor) | pending | 1 |
 | ↳ M3.4.c | In-place stamps (`Chunk::deactivate`, `update_heart_beat`, etc.) | pending | 1 |
 | **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
 | **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
