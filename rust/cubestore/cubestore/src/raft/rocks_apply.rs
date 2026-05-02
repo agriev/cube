@@ -40,6 +40,7 @@
 //! is atomic across the dispatched commands. Until then, `Batch`
 //! returns an error.
 
+use crate::metastore::job::{Job, JobStatus};
 use crate::metastore::multi_index::MultiPartition;
 use crate::metastore::replay_handle::SeqPointer;
 use crate::metastore::source::SourceCredentials;
@@ -291,6 +292,68 @@ impl Apply for RocksMetaStoreApply {
                 self.store.delete_wal(wal_id).await?;
                 Ok(MetaCommandResult::Unit)
             }
+            MetaCommand::WalUploaded { wal_id } => {
+                let row = self.store.wal_uploaded(wal_id).await?;
+                wrap_id_row(IdRowKind::Wal, &row)
+            }
+
+            // ---- Chunk uploads / activates / swaps (M3.3.b.2 Cat E) -------
+            MetaCommand::ChunkUploaded { chunk_id } => {
+                let row = self.store.chunk_uploaded(chunk_id).await?;
+                wrap_id_row(IdRowKind::Chunk, &row)
+            }
+            MetaCommand::SwapChunks {
+                deactivate_ids,
+                uploaded_ids_and_sizes,
+                new_replay_handle_id,
+            } => {
+                self.store
+                    .swap_chunks(deactivate_ids, uploaded_ids_and_sizes, new_replay_handle_id)
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+            MetaCommand::SwapChunksWithoutCheck {
+                deactivate_ids,
+                uploaded_ids_and_sizes,
+                new_replay_handle_id,
+            } => {
+                self.store
+                    .swap_chunks_without_check(
+                        deactivate_ids,
+                        uploaded_ids_and_sizes,
+                        new_replay_handle_id,
+                    )
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+            MetaCommand::DeactivateChunksWithoutCheck { deactivate_ids } => {
+                self.store
+                    .deactivate_chunks_without_check(deactivate_ids)
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+            MetaCommand::ActivateChunks {
+                table_id,
+                uploaded_chunk_ids,
+                replay_handle_id,
+            } => {
+                self.store
+                    .activate_chunks(table_id, uploaded_chunk_ids, replay_handle_id)
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+
+            // ---- Tables: ready (M3.3.b.2) ---------------------------------
+            MetaCommand::TableReady { table_id, is_ready } => {
+                let row = self.store.table_ready(table_id, is_ready).await?;
+                wrap_id_row(IdRowKind::Table, &row)
+            }
+
+            // ---- Indexes: drop_partitioned_index (M3.3.b.2) ---------------
+            MetaCommand::DropPartitionedIndex { schema, name } => {
+                self.store.drop_partitioned_index(schema, name).await?;
+                Ok(MetaCommandResult::Unit)
+            }
 
             // ---- Jobs ------------------------------------------------------
             MetaCommand::DeleteJob { job_id } => {
@@ -301,11 +364,62 @@ impl Apply for RocksMetaStoreApply {
                 let row = self.store.update_heart_beat(job_id).await?;
                 wrap_id_row(IdRowKind::Job, &row)
             }
+            MetaCommand::AddJob { job_blob } => {
+                let job: Job = decode_typed_blob(&job_blob, "job_blob")?;
+                let opt = self.store.add_job(job).await?;
+                MetaCommandResult::optional_id_row(IdRowKind::Job, opt.as_ref()).map_err(|e| {
+                    CubeError::internal(format!("encode AddJob result: {}", e))
+                })
+            }
+            MetaCommand::StartProcessingJob {
+                server_name,
+                long_term,
+            } => {
+                let opt = self
+                    .store
+                    .start_processing_job(server_name, long_term)
+                    .await?;
+                MetaCommandResult::optional_id_row(IdRowKind::Job, opt.as_ref()).map_err(|e| {
+                    CubeError::internal(format!("encode StartProcessingJob result: {}", e))
+                })
+            }
+            MetaCommand::UpdateStatus {
+                job_id,
+                status_blob,
+            } => {
+                let status: JobStatus = decode_typed_blob(&status_blob, "status_blob")?;
+                let row = self.store.update_status(job_id, status).await?;
+                wrap_id_row(IdRowKind::Job, &row)
+            }
 
             // ---- Sources ---------------------------------------------------
             MetaCommand::DeleteSource { id } => {
                 let row = self.store.delete_source(id).await?;
                 wrap_id_row(IdRowKind::Source, &row)
+            }
+
+            // ---- Replay handle ops (M3.3.b.2) -----------------------------
+            MetaCommand::UpdateReplayHandleFailedIfExists { id, failed } => {
+                self.store
+                    .update_replay_handle_failed_if_exists(id, failed)
+                    .await?;
+                Ok(MetaCommandResult::Unit)
+            }
+            MetaCommand::ReplaceReplayHandles {
+                old_ids,
+                new_seq_pointer_blob,
+            } => {
+                let new_seq: Option<Vec<Option<SeqPointer>>> =
+                    decode_typed_blob(&new_seq_pointer_blob, "new_seq_pointer_blob")?;
+                let opt = self.store.replace_replay_handles(old_ids, new_seq).await?;
+                MetaCommandResult::optional_id_row(IdRowKind::ReplayHandle, opt.as_ref()).map_err(
+                    |e| {
+                        CubeError::internal(format!(
+                            "encode ReplaceReplayHandles result: {}",
+                            e
+                        ))
+                    },
+                )
             }
 
             // ---- Snapshot --------------------------------------------------

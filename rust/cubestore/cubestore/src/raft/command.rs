@@ -269,6 +269,88 @@ pub enum MetaCommand {
         seq_pointers_blob: Vec<u8>,
     },
 
+    // ---- Cat A: simple uploads/seals (M3.3.b.2) -------------------------
+    /// `chunk_uploaded(chunk_id) -> IdRow<Chunk>` — flips the upload flag.
+    ChunkUploaded {
+        chunk_id: u64,
+    },
+    /// `wal_uploaded(wal_id) -> IdRow<WAL>` — same shape for WALs.
+    WalUploaded {
+        wal_id: u64,
+    },
+
+    // ---- Cat B: simple two-arg setters (M3.3.b.2) -----------------------
+    /// `table_ready(id, is_ready) -> IdRow<Table>`.
+    TableReady {
+        table_id: u64,
+        is_ready: bool,
+    },
+    /// `drop_partitioned_index(schema, name) -> ()`.
+    DropPartitionedIndex {
+        schema: String,
+        name: String,
+    },
+    /// `update_replay_handle_failed_if_exists(id, failed) -> ()`.
+    UpdateReplayHandleFailedIfExists {
+        id: u64,
+        failed: bool,
+    },
+
+    // ---- Cat F: job lifecycle (M3.3.b.2) --------------------------------
+    /// `add_job(Job) -> Option<IdRow<Job>>` — returns `None` if a job
+    /// for the same row reference + type is already queued.
+    AddJob {
+        /// flex-encoded `Job` (from `crate::metastore::job::Job`).
+        /// Includes `last_heart_beat: DateTime<Utc>` which is stamped on
+        /// the leader before encode and replicated verbatim — that's
+        /// the determinism boundary for this variant.
+        job_blob: Vec<u8>,
+    },
+    StartProcessingJob {
+        server_name: String,
+        long_term: bool,
+    },
+    UpdateStatus {
+        job_id: u64,
+        /// flex-encoded `JobStatus` (enum).
+        status_blob: Vec<u8>,
+    },
+
+    // ---- Cat E: atomic chunk swap ops (M3.3.b.2) ------------------------
+    // All return `()` — they're fire-and-forget atomic ops on the
+    // underlying RocksDB WriteBatch.
+    SwapChunks {
+        deactivate_ids: Vec<u64>,
+        /// `Vec<(chunk_id, Option<file_size>)>` — file_size is `None`
+        /// for in-memory chunks where it's not yet known.
+        uploaded_ids_and_sizes: Vec<(u64, Option<u64>)>,
+        new_replay_handle_id: Option<u64>,
+    },
+    SwapChunksWithoutCheck {
+        deactivate_ids: Vec<u64>,
+        uploaded_ids_and_sizes: Vec<(u64, Option<u64>)>,
+        new_replay_handle_id: Option<u64>,
+    },
+    DeactivateChunksWithoutCheck {
+        deactivate_ids: Vec<u64>,
+    },
+    ActivateChunks {
+        table_id: u64,
+        uploaded_chunk_ids: Vec<(u64, Option<u64>)>,
+        replay_handle_id: Option<u64>,
+    },
+
+    // ---- Cat F: replay handle merge (M3.3.b.2) --------------------------
+    /// `replace_replay_handles(old_ids, new_seq_pointer) -> Option<IdRow<ReplayHandle>>`.
+    ReplaceReplayHandles {
+        old_ids: Vec<u64>,
+        /// flex-encoded `Option<Vec<Option<SeqPointer>>>` —
+        /// kept as a blob even though `Option<...>` could nest in the
+        /// variant directly, because `SeqPointer` lives in the metastore
+        /// and the raft module doesn't import metastore types.
+        new_seq_pointer_blob: Vec<u8>,
+    },
+
     // ---- Atomic batch ----------------------------------------------------
     /// Multi-statement DDL — `BatchPipe`. Applied as a single RocksDB
     /// `WriteBatch` on the apply path so the whole sequence either
@@ -680,6 +762,107 @@ mod tests {
         round_trip(MetaCommand::ReleasePartitionedLock {
             payload_version: 1,
             payload: vec![],
+        });
+    }
+
+    #[test]
+    fn cat_a_uploads_round_trip() {
+        round_trip(MetaCommand::ChunkUploaded { chunk_id: 1 });
+        round_trip(MetaCommand::ChunkUploaded { chunk_id: u64::MAX });
+        round_trip(MetaCommand::WalUploaded { wal_id: 0 });
+    }
+
+    #[test]
+    fn cat_b_setters_round_trip() {
+        round_trip(MetaCommand::TableReady {
+            table_id: 1,
+            is_ready: true,
+        });
+        round_trip(MetaCommand::TableReady {
+            table_id: 0,
+            is_ready: false,
+        });
+        round_trip(MetaCommand::DropPartitionedIndex {
+            schema: "public".into(),
+            name: "by_country".into(),
+        });
+        round_trip(MetaCommand::DropPartitionedIndex {
+            schema: String::new(),
+            name: String::new(),
+        });
+        round_trip(MetaCommand::UpdateReplayHandleFailedIfExists {
+            id: 7,
+            failed: true,
+        });
+    }
+
+    #[test]
+    fn cat_f_jobs_round_trip() {
+        round_trip(MetaCommand::AddJob {
+            job_blob: vec![0xAA; 128],
+        });
+        round_trip(MetaCommand::StartProcessingJob {
+            server_name: "node1".into(),
+            long_term: true,
+        });
+        round_trip(MetaCommand::StartProcessingJob {
+            server_name: String::new(),
+            long_term: false,
+        });
+        round_trip(MetaCommand::UpdateStatus {
+            job_id: 42,
+            status_blob: vec![0xBB; 64],
+        });
+    }
+
+    #[test]
+    fn cat_e_chunk_swaps_round_trip() {
+        round_trip(MetaCommand::SwapChunks {
+            deactivate_ids: vec![1, 2, 3],
+            uploaded_ids_and_sizes: vec![(10, Some(1024)), (11, None), (12, Some(0))],
+            new_replay_handle_id: Some(99),
+        });
+        round_trip(MetaCommand::SwapChunks {
+            deactivate_ids: vec![],
+            uploaded_ids_and_sizes: vec![],
+            new_replay_handle_id: None,
+        });
+
+        round_trip(MetaCommand::SwapChunksWithoutCheck {
+            deactivate_ids: vec![5, 6],
+            uploaded_ids_and_sizes: vec![(7, Some(2048))],
+            new_replay_handle_id: None,
+        });
+
+        round_trip(MetaCommand::DeactivateChunksWithoutCheck {
+            deactivate_ids: vec![1, 2, 3, 4, 5],
+        });
+        round_trip(MetaCommand::DeactivateChunksWithoutCheck {
+            deactivate_ids: vec![],
+        });
+
+        round_trip(MetaCommand::ActivateChunks {
+            table_id: 1,
+            uploaded_chunk_ids: vec![(100, Some(512)), (101, None)],
+            replay_handle_id: Some(7),
+        });
+        round_trip(MetaCommand::ActivateChunks {
+            table_id: u64::MAX,
+            uploaded_chunk_ids: vec![],
+            replay_handle_id: None,
+        });
+    }
+
+    #[test]
+    fn cat_f_replace_replay_handles_round_trip() {
+        round_trip(MetaCommand::ReplaceReplayHandles {
+            old_ids: vec![1, 2, 3],
+            new_seq_pointer_blob: vec![0xCC; 96],
+        });
+        // empty old_ids + empty blob — degenerate but legal.
+        round_trip(MetaCommand::ReplaceReplayHandles {
+            old_ids: vec![],
+            new_seq_pointer_blob: vec![],
         });
     }
 
