@@ -154,7 +154,7 @@ jobs:
         # glance. The job still goes red if anything fails.
         run: |
           cargo test --package cubestore-sql-tests --release \
-            --test in_process --no-fail-fast
+            --test in-process --no-fail-fast
 
   # Helm chart + container image are validated in the consumer repo
   # (agriev/cube-stack-deployment), no need to duplicate here.
