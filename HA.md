@@ -3,8 +3,14 @@
 This is a **fork** of [cube-js/cube](https://github.com/cube-js/cube) that adds
 **high availability** to the OSS Cube Store router.
 
-> **Status: M1 of 10 — scaffolding complete, no replication yet.**
-> Do not deploy to production. Track [ROADMAP](#roadmap) below.
+> **Status: M3 of 10 complete — single-node Raft replication for metastore writes works
+> end-to-end; the upstream `cubestore-sql-tests` in-process suite passes under
+> `CUBESTORE_HA_MODE=raft` in CI.**
+>
+> Multi-node clustering (M4) and the rest of the production-readiness
+> milestones (snapshots, leader-aware routing, Helm chart, observability,
+> docs) are still ahead. Do not deploy to production. Track
+> [ROADMAP](#roadmap) below.
 
 ## Why this fork exists
 

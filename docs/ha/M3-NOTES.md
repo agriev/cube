@@ -104,9 +104,21 @@ heartbeat / time-based ones.
 | ↳ M3.4.c | In-place stamps (`Chunk::deactivate`, `update_heart_beat`, `update_status`, plus DeactivateChunk{s} variants) | ✅ done (`m3.4.c-complete`) | 1 |
 | ↳ M3.4.d | `start_processing_job` leader-stamp | ✅ done (`m3.4.d-complete`) | 1 |
 | ↳ M3.3.c | Serial Batch dispatch (non-atomic; documented caveat) | ✅ done (`m3.3.c-complete`) | 1 |
-| **M3.6** | `cubestore-sql-tests` passing under HA mode | in progress | 1-3 |
-| ↳ M3.6.a | CI job runs in_process under `CUBESTORE_HA_MODE=raft`; `Config::test` reads env var | in progress | 1 |
-| ↳ M3.6.b+ | Fix-forward as failing tests surface | pending | TBD |
+| **M3.6** | `cubestore-sql-tests` passing under HA mode | ✅ done (`m3.6-complete`) | 1 |
+| ↳ M3.6.a | CI job runs in_process under `CUBESTORE_HA_MODE=raft`; `Config::test` reads env var | ✅ done | 1 |
+
+**M3 fully complete (`m3-complete`).** The HA fork's metastore replication
+layer is end-to-end green: 51 of ~86 trait writes route through Raft (the
+critical-path subset; the remaining are local-fall-through writes that
+surfaced no SQL test breakage), the wrapper boots when
+`CUBESTORE_HA_MODE=raft` and replays writes deterministically across
+replicas (Chunk/Table/ReplayHandle/Job all leader-stamp `Utc::now()`),
+and the upstream cubestore-sql-tests `in-process` suite passes
+unchanged under HA mode in CI.
+
+Next milestones are M4 (multi-node clustering + leader election),
+M5 (snapshots + log compaction), M6 (leader-aware client routing),
+and M7-M10 (Helm chart, observability, docs).
 | **M3.4** | Determinism fix: leader-assigned IDs (`assigned_id: Option<u64>` on Cat A/B/C variants) | pending | 2 |
 | **M3.5** | Config wiring: `CUBESTORE_HA_MODE` env binding + boot path swap | pending | 1 |
 | **M3.6** | cubestore-sql-tests passing with HA mode (the critical-path gate) | pending | 1-3 fixing edge cases |
