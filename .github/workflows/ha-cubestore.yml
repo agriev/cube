@@ -1,0 +1,102 @@
+name: ha-cubestore
+
+# HA-fork-specific CI. Runs only on ha-main and on PRs that touch the fork's
+# new code. Upstream master.yml is unchanged and continues to run on `master`.
+#
+# Goal: catch dependency conflicts / build breakage in cubestore introduced
+# by the new raft module before they land on ha-main, without paying for
+# upstream's full driver-tests matrix on every fork push.
+
+on:
+  push:
+    branches: [ha-main]
+    paths:
+      - 'rust/cubestore/**'
+      - 'HA.md'
+      - 'docs/ha/**'
+      - '.github/workflows/ha-cubestore.yml'
+  pull_request:
+    branches: [ha-main]
+    paths:
+      - 'rust/cubestore/**'
+      - '.github/workflows/ha-cubestore.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast feedback: codec / unit tests of the new raft module in isolation.
+  # The mini-crate has no upstream-cubestore deps, so it's seconds to compile.
+  raft-codec-tests:
+    name: raft codec — isolated unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - name: Build mini-crate from raft/command.rs
+        run: |
+          mkdir -p /tmp/m1/src
+          cp rust/cubestore/cubestore/src/raft/command.rs /tmp/m1/src/lib.rs
+          cat > /tmp/m1/Cargo.toml <<'EOF'
+          [package]
+          name = "ha-codec-test"
+          version = "0.0.0"
+          edition = "2021"
+          [dependencies]
+          serde = "1"
+          serde_derive = "1"
+          flexbuffers = "2.0"
+          [lib]
+          path = "src/lib.rs"
+          EOF
+
+      - name: cargo test
+        working-directory: /tmp/m1
+        run: cargo test --release --no-fail-fast
+
+  # Slow feedback: full cubestore cargo check to catch any conflicts the
+  # new raft / slog deps introduce against the existing dependency tree.
+  cubestore-check:
+    name: cubestore cargo check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/cubestore/target
+          key: ${{ runner.os }}-cubestore-${{ hashFiles('rust/cubestore/**/Cargo.lock', 'rust/cubestore/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cubestore-
+
+      - name: Install Linux build prereqs (libpq, sasl, etc.)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential pkg-config libssl-dev libsasl2-dev \
+            libpq-dev liblz4-dev libzstd-dev
+
+      - name: Install Rust toolchain pinned in rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-01
+          components: rustfmt,clippy
+
+      - name: cargo check (cubestore + tests)
+        working-directory: rust/cubestore
+        run: cargo check --package cubestore --tests --message-format=short
+
+      - name: cargo test raft module (no networking, deterministic)
+        working-directory: rust/cubestore
+        run: cargo test --package cubestore --lib raft::command::tests --release --no-fail-fast
+
+  # Helm chart + container image are validated in the consumer repo
+  # (agriev/cube-stack-deployment), no need to duplicate here.
