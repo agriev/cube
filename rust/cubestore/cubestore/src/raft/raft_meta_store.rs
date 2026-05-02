@@ -61,19 +61,21 @@
 use crate::metastore::job::{Job, JobStatus, JobType};
 use crate::metastore::multi_index::{MultiIndex, MultiPartition};
 use crate::metastore::replay_handle::{ReplayHandle, SeqPointer};
-use crate::metastore::rocks_store::{RocksPropertyRow, RowKey};
+// `RocksPropertyRow` and `RowKey` come from `metastore::rocks_store`
+// (private mod) but are re-exported via `pub use rocks_store::*` at the
+// metastore root, so the canonical user-facing path is bare `metastore`.
 use crate::metastore::snapshot_info::SnapshotInfo;
 use crate::metastore::source::{Source, SourceCredentials};
 use crate::metastore::table::{StreamOffset, Table, TablePath};
 use crate::metastore::{
     Chunk, ChunkMetaStoreTable, Column, IdRow, ImportFormat, Index, IndexDef, IndexMetaStoreTable,
-    MetaStore, Partition, PartitionData, PartitionMetaStoreTable, RocksMetaStore, Schema,
-    SchemaMetaStoreTable, TableMetaStoreTable, WAL,
+    MetaStore, Partition, PartitionData, PartitionMetaStoreTable, RocksMetaStore,
+    RocksPropertyRow, RowKey, Schema, SchemaMetaStoreTable, TableMetaStoreTable, WAL,
 };
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResultMismatch};
 use crate::raft::rocks_apply::RocksMetaStoreApply;
 use crate::raft::state_machine::{RaftError, RaftNode};
-use Row;
+use crate::table::Row;
 use crate::CubeError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
