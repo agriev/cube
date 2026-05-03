@@ -580,6 +580,82 @@ pub trait ConfigObj: DIService {
     /// Default: `<data_dir>/raft-log/`. Must be on persistent storage
     /// (the same PVC as the metastore RocksDB).
     fn ha_raft_log_dir(&self) -> PathBuf;
+
+    /// Initial peer set for the Raft cluster. Empty in single-node /
+    /// `HaMode::Off`. M4.5 — used by the cuberpc transport bootstrap
+    /// to dial peers on startup. Mutations after bootstrap go through
+    /// raft ConfChange entries, not this config.
+    fn ha_raft_peers(&self) -> Vec<HaPeer>;
+
+    /// TCP port the raft transport listens on for inbound peer
+    /// messages. Distinct from the metadata port (9999) so heartbeat
+    /// traffic doesn't compete with select queries. Default 9100.
+    fn ha_raft_port(&self) -> u16;
+}
+
+/// A single Raft peer, as parsed from `CUBESTORE_RAFT_PEERS`.
+/// Wire-format string: `<id>@<host>:<port>`. The local node's own
+/// entry MUST appear in the list — every replica boots from the same
+/// peer set so the ConfState is identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaPeer {
+    pub id: u64,
+    pub host: String,
+    pub port: u16,
+}
+
+impl HaPeer {
+    /// Parse a single `<id>@<host>:<port>` entry. Hostnames may
+    /// contain dots (`cubestore-router-0.cubestore-router.cube`) —
+    /// only the LAST `:` is treated as the port separator.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let (id_str, host_port) = spec
+            .split_once('@')
+            .ok_or_else(|| format!("peer spec missing '@': {:?}", spec))?;
+        let id: u64 = id_str
+            .parse()
+            .map_err(|_| format!("peer id is not a u64: {:?}", id_str))?;
+        if id == 0 {
+            return Err(format!(
+                "peer id 0 is reserved by raft-rs, got {:?}",
+                spec
+            ));
+        }
+        let (host, port_str) = host_port
+            .rsplit_once(':')
+            .ok_or_else(|| format!("peer spec missing ':<port>': {:?}", spec))?;
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| format!("peer port is not a u16: {:?}", port_str))?;
+        if host.is_empty() {
+            return Err(format!("peer host is empty: {:?}", spec));
+        }
+        Ok(Self {
+            id,
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    /// Parse a comma-separated list. Empty strings between commas
+    /// are skipped (forgiving for `peer1,,peer2` or trailing commas
+    /// in editor configs). Duplicate ids error out — silent
+    /// dedup would mask a real misconfiguration.
+    pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
+        let mut out = Vec::new();
+        for part in s.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let p = Self::parse(trimmed)?;
+            if out.iter().any(|q: &Self| q.id == p.id) {
+                return Err(format!("duplicate peer id {}: {:?}", p.id, s));
+            }
+            out.push(p);
+        }
+        Ok(out)
+    }
 }
 
 /// The HA fork's top-level switch. Default is `Off` — drop-in
@@ -724,6 +800,10 @@ pub struct ConfigObjImpl {
     pub ha_mode: HaMode,
     pub ha_node_id: u64,
     pub ha_raft_log_dir: PathBuf,
+    /// M4.5 — initial peer set, parsed from CUBESTORE_RAFT_PEERS.
+    pub ha_raft_peers: Vec<HaPeer>,
+    /// M4.5 — listen port for inbound raft messages.
+    pub ha_raft_port: u16,
 }
 
 crate::di_service!(ConfigObjImpl, [ConfigObj]);
@@ -1145,6 +1225,14 @@ impl ConfigObj for ConfigObjImpl {
     fn ha_raft_log_dir(&self) -> PathBuf {
         self.ha_raft_log_dir.clone()
     }
+
+    fn ha_raft_peers(&self) -> Vec<HaPeer> {
+        self.ha_raft_peers.clone()
+    }
+
+    fn ha_raft_port(&self) -> u16 {
+        self.ha_raft_port
+    }
 }
 
 lazy_static! {
@@ -1354,6 +1442,15 @@ impl Config {
             .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("raft-log"));
+        // M4.5: peer-list bootstrap. Empty unless explicitly set —
+        // single-node mode (`HaMode::Off`) doesn't need peers, and
+        // raft-mode without peers errors out at boot in
+        // `configure_meta_store`. Format: `1@router-0:9100,2@router-1:9100,3@router-2:9100`.
+        let ha_raft_peers = match env::var("CUBESTORE_RAFT_PEERS") {
+            Ok(s) => HaPeer::parse_list(&s).expect("CUBESTORE_RAFT_PEERS: invalid value"),
+            Err(_) => Vec::new(),
+        };
+        let ha_raft_port = env_parse::<u16>("CUBESTORE_RAFT_PORT", 9100u16);
 
         let result = Config {
             injector: Injector::new(),
@@ -1706,6 +1803,8 @@ impl Config {
                 ha_mode,
                 ha_node_id,
                 ha_raft_log_dir,
+                ha_raft_peers,
+                ha_raft_port,
             }),
         };
         result.validate_config();
@@ -1872,6 +1971,11 @@ impl Config {
                     .unwrap_or(HaMode::Off),
                 ha_node_id: env_parse("CUBESTORE_NODE_ID", 1u64),
                 ha_raft_log_dir: Self::test_data_dir_path(directory, name).join("raft-log"),
+                // Tests don't bring up multi-node clusters by default.
+                // Multi-node integration tests construct configs by
+                // hand and override these fields directly.
+                ha_raft_peers: Vec::new(),
+                ha_raft_port: 9100,
             }
         }
     }
@@ -2801,5 +2905,92 @@ mod ha_mode_tests {
     #[test]
     fn default_is_off() {
         assert_eq!(HaMode::default(), HaMode::Off);
+    }
+}
+
+#[cfg(test)]
+mod ha_peer_tests {
+    use super::HaPeer;
+
+    #[test]
+    fn parses_canonical_spec() {
+        let p = HaPeer::parse("1@router-0:9100").unwrap();
+        assert_eq!(p.id, 1);
+        assert_eq!(p.host, "router-0");
+        assert_eq!(p.port, 9100);
+    }
+
+    #[test]
+    fn parses_dotted_kubernetes_hostname() {
+        // StatefulSet headless DNS: <pod>.<service>.<ns>.svc.cluster.local
+        let p =
+            HaPeer::parse("2@cubestore-router-1.cubestore-router.cube.svc.cluster.local:9100")
+                .unwrap();
+        assert_eq!(p.id, 2);
+        assert_eq!(
+            p.host,
+            "cubestore-router-1.cubestore-router.cube.svc.cluster.local"
+        );
+        assert_eq!(p.port, 9100);
+    }
+
+    #[test]
+    fn parses_three_node_list() {
+        let peers = HaPeer::parse_list(
+            "1@router-0:9100,2@router-1:9100,3@router-2:9100",
+        )
+        .unwrap();
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0].id, 1);
+        assert_eq!(peers[2].host, "router-2");
+    }
+
+    #[test]
+    fn skips_blanks_and_trailing_commas() {
+        let peers = HaPeer::parse_list("1@a:9100, ,,2@b:9100,").unwrap();
+        assert_eq!(peers.len(), 2);
+    }
+
+    #[test]
+    fn empty_string_yields_empty_list() {
+        assert!(HaPeer::parse_list("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_missing_at() {
+        let err = HaPeer::parse("router-0:9100").unwrap_err();
+        assert!(err.contains("missing '@'"));
+    }
+
+    #[test]
+    fn rejects_missing_port() {
+        let err = HaPeer::parse("1@router-0").unwrap_err();
+        assert!(err.contains(":<port>"));
+    }
+
+    #[test]
+    fn rejects_non_numeric_id() {
+        let err = HaPeer::parse("a@router-0:9100").unwrap_err();
+        assert!(err.contains("u64"));
+    }
+
+    #[test]
+    fn rejects_id_zero() {
+        // raft-rs reserves id 0 for "no peer". Accepting 0 here would
+        // produce a silently-broken cluster on the first heartbeat.
+        let err = HaPeer::parse("0@router-0:9100").unwrap_err();
+        assert!(err.contains("reserved"));
+    }
+
+    #[test]
+    fn rejects_oversized_port() {
+        let err = HaPeer::parse("1@router-0:99999").unwrap_err();
+        assert!(err.contains("u16"));
+    }
+
+    #[test]
+    fn rejects_duplicate_ids() {
+        let err = HaPeer::parse_list("1@a:9100,1@b:9100").unwrap_err();
+        assert!(err.contains("duplicate peer id"));
     }
 }
