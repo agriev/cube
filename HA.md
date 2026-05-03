@@ -12,11 +12,10 @@ This is a **fork** of [cube-js/cube](https://github.com/cube-js/cube) that adds
 > include a step-by-step migration guide.
 >
 > **Remaining for production**: M7 Helm chart wiring (lives in
-> [agriev/cube-stack-deployment](https://github.com/agriev/cube-stack-deployment)),
-> M8 chaos suite at k8s scale, and M5.x S3 upload of raft snapshots
-> (peer-to-peer MsgSnapshot already covers late-joiners; S3 upload
-> shaves ~5 min RPO during all-replicas-offline disasters by closing
-> the gap to the inner RocksMetaStore checkpoint cadence). Track
+> [agriev/cube-stack-deployment](https://github.com/agriev/cube-stack-deployment))
+> and M8 chaos suite at k8s scale. Both are outside this fork —
+> the entire metadata-replication core, including remote snapshot
+> backup, is fully landed and CI-green inside `agriev/cube`. Track
 > [ROADMAP](#roadmap) below.
 
 ## Why this fork exists
@@ -84,7 +83,7 @@ to whether replication is on. See [HA design plan](docs/ha/PLAN.md).
 | M2 | Single-node Raft with local RocksDB log | ✅ **done** |
 | M3 | Wire all `MetaStore` writes through the apply path | ✅ **done** (`m3-complete`) |
 | M4 | 3-node clustering, leader election, follower replication | ✅ **done** (`m4-complete`) |
-| M5 | Snapshot + log compaction over `RemoteFs` | ✅ **done at storage layer** (`m5-storage-complete`) — S3 upload of `snapshot.bin` is the remaining nice-to-have (peer-to-peer MsgSnapshot path already covers late-joiners) |
+| M5 | Snapshot + log compaction over `RemoteFs` | ✅ **done** — storage layer (`m5-storage-complete`) + S3 upload of `snapshot.bin` (M5.x). Late-joining followers catch up peer-to-peer via raft's MsgSnapshot; remote copy covers the all-replicas-offline DR scenario. |
 | M6 | Leader-aware client routing (Cube API + workers) | ✅ **done** — raft-rs auto-forwards proposes from followers; M6.1 exposes `current_leader_id` for k8s readinessProbe; M6.2 marks no-leader errors with `raft-leader-id=N` for smart retries |
 | M7 | Helm chart updates (`agriev/cube-stack-deployment`) | todo (separate repo) |
 | M8 | Chaos & soak tests (kill -9, drain, partition) | todo (M4 chaos test for unit scope is in CI; k8s-scale soak still ahead) |

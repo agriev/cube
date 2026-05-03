@@ -39,6 +39,7 @@
 //! - [x] M9.1 — operator metrics (`cs.raft.*` term, leader_id,
 //!         commit/applied index, leader_changes, proposals,
 //!         apply_duration_ms)
+//! - [x] M9.2 — Grafana dashboard JSON (in `docs/ha/grafana/`)
 //! - [x] M5.1 — `RaftStorage` snapshot persistence (save/read,
 //!         atomic temp-file + rename, Storage::snapshot impl)
 //! - [x] M5.2 — `snapshot_payload` pack_dir/unpack_dir + path-
@@ -48,9 +49,14 @@
 //! - [x] M5.5 — Log compaction with `keep_past`
 //! - [x] M5.6.1 — `RaftStorage::apply_snapshot` for inbound
 //! - [x] M5.6.2 — `drive_ready` handles `ready.snapshot`
+//! - [x] M5.x — RemoteFs upload of `snapshot.bin` to
+//!         `raft-snapshots/latest.bin`
+//! - [x] M6.1 — `current_leader_id()` introspection
+//! - [x] M6.2 — `raft-leader-id=N` hint marker in propose errors
+//! - [x] M10 — README banner + `docs/ha/MIGRATION.md`
 //! - [ ] M5.6.3 — full cluster MsgSnapshot ship test (deferred to M8)
-//! - [ ] M5 — RemoteFs upload of snapshot.bin (operator-facing
-//!         retention; trigger_snapshot is local-only today)
+//! - [ ] M7 — Helm chart updates (lives in `agriev/cube-stack-deployment`)
+//! - [ ] M8 — Chaos & soak tests at k8s scale
 
 pub mod command;
 pub mod raft_meta_store;
