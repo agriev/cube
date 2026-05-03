@@ -32,8 +32,11 @@
 //!         message paths, persisted-messages quirk fixed
 //! - [x] M4.3 — 3-node cluster test: election + replication + apply
 //! - [x] M4.4 — Leader failover test via partition injection
-//! - [ ] M4.5 — cuberpc-backed transport + `CUBESTORE_RAFT_PEERS`
-//! - [ ] M5 — Snapshot + log compaction
+//! - [x] M4.5.1 — `HaPeer` parser + `CUBESTORE_RAFT_PEERS` config
+//! - [x] M4.5.2 — `TcpTransport` + `spawn_listener` + 3-node-over-TCP
+//! - [x] M4.5.3 — `configure_meta_store` boot wiring through TCP
+//! - [x] M4 chaos — 20 partition cycles converge under 5s each
+//! - [ ] M5 — Snapshot + log compaction over `RemoteFs`
 
 pub mod command;
 pub mod raft_meta_store;
