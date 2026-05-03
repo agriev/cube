@@ -10,3 +10,5 @@ cubestore/target
 cubesql/target
 cubestore-sql-tests/data/**
 cubestore/db-tmp
+# Local raft snapshot/staging scratch produced by `cargo test`
+cubestore/test-*-local/
