@@ -184,7 +184,8 @@ impl RaftMetaStore {
         tail[..end].parse::<u64>().ok()
     }
 
-    /// M5.4 + M5.5 — explicit snapshot trigger with log compaction.
+    /// M5.4 + M5.5 + M5.x — explicit snapshot trigger with log
+    /// compaction and best-effort remote upload.
     ///
     /// 1. Reads the current `applied_index` from the raft storage.
     /// 2. Reads the current ConfState (and looks up the term for
@@ -259,6 +260,42 @@ impl RaftMetaStore {
         storage
             .save_snapshot(&snapshot)
             .map_err(|e| CubeError::internal(format!("save_snapshot: {}", e)))?;
+
+        // M5.x — best-effort remote upload of `snapshot.bin` to S3
+        // (or whatever backs the metastore_fs). The local persistence
+        // is the source of truth — if remote upload fails we log and
+        // proceed; raft-rs's peer-to-peer MsgSnapshot path still works
+        // for late-joining followers. The remote copy is only
+        // load-bearing for "all replicas offline at once" disaster
+        // recovery, where the alternative (`metastore-current`
+        // checkpoint) lags by the inner RocksMetaStore's upload
+        // cadence.
+        let snapshot_bin_path = storage.snapshot_data_path();
+        if snapshot_bin_path.exists() {
+            let metastore_fs = self.store.metastore_fs();
+            if let Err(e) = metastore_fs
+                .upload_raft_snapshot_file(
+                    snapshot_bin_path,
+                    // Single fixed remote name — we only retain the
+                    // latest snapshot, mirroring local retention.
+                    // A future enhancement is index-stamped names
+                    // for point-in-time restore.
+                    "latest.bin".to_string(),
+                )
+                .await
+            {
+                log::warn!(
+                    "raft snapshot remote upload failed (local save still valid): {}",
+                    e
+                );
+            }
+        } else {
+            log::debug!(
+                "raft snapshot remote upload skipped: \
+                 snapshot.bin not present at {:?} (was save_snapshot a no-op?)",
+                snapshot_bin_path
+            );
+        }
 
         // M5.5 — log compaction.
         //
@@ -1631,6 +1668,52 @@ mod tests {
     fn parse_leader_hint_returns_none_for_garbage_value() {
         let err = CubeError::internal("raft-leader-id=abc".into());
         assert_eq!(RaftMetaStore::parse_leader_hint(&err), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trigger_snapshot_uploads_to_remote_fs() {
+        let (wrapper, sp, rp, raft_dir) =
+            setup_wrapper("raft_trigger_snapshot_remote_upload");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        wrapper
+            .create_schema("upload-test".into(), false)
+            .await
+            .expect("create schema");
+
+        let staging = raft_dir.path().join("snapshot-staging");
+        wrapper
+            .trigger_snapshot(&staging, u64::MAX)
+            .await
+            .expect("trigger_snapshot");
+
+        // The fixed remote layout used by upload_raft_snapshot_file:
+        // `raft-snapshots/latest.bin`. LocalDirRemoteFs writes into
+        // the remote_path we constructed in setup_wrapper, so the
+        // upload landed at `<rp>/raft-snapshots/latest.bin`.
+        let uploaded = rp.join("raft-snapshots").join("latest.bin");
+        assert!(
+            uploaded.exists(),
+            "snapshot.bin must be uploaded to remote at {:?}",
+            uploaded
+        );
+
+        // Sanity: the uploaded file should equal the local
+        // snapshot.bin byte-for-byte.
+        use raft::Storage;
+        let storage = wrapper.raft.storage();
+        let local = storage.snapshot_data_path();
+        let local_bytes = std::fs::read(&local).expect("read local snapshot.bin");
+        let remote_bytes = std::fs::read(&uploaded).expect("read uploaded snapshot.bin");
+        assert_eq!(
+            local_bytes, remote_bytes,
+            "remote snapshot must match local byte-for-byte"
+        );
+
+        // Storage::snapshot still works after upload (sanity).
+        let _ = Storage::snapshot(&storage, 0, 0).expect("storage snapshot still readable");
+
+        cleanup(&sp, &rp);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

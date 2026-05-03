@@ -269,8 +269,10 @@ impl RaftStorage {
     // M5.1 — Snapshot persistence
     // -----------------------------------------------------------------
 
-    /// Path to the on-disk snapshot data file.
-    fn snapshot_data_path(&self) -> PathBuf {
+    /// Path to the on-disk snapshot data file. Public so the M5.x
+    /// remote-upload path can find the file written by
+    /// `save_snapshot` without re-deriving the dir.
+    pub fn snapshot_data_path(&self) -> PathBuf {
         self.dir.join(SNAPSHOT_DATA_FILE)
     }
 
@@ -615,6 +617,10 @@ impl SharedRaftStorage {
 
     pub fn apply_snapshot(&self, snapshot: Snapshot) -> Result<(), RaftStorageError> {
         self.0.apply_snapshot(snapshot)
+    }
+
+    pub fn snapshot_data_path(&self) -> PathBuf {
+        self.0.snapshot_data_path()
     }
 
     /// Read the cached ConfState. Used by the M5.4 snapshot trigger

@@ -885,7 +885,7 @@ pub struct RocksStore {
     pub config: Arc<dyn ConfigObj>,
     seq_store: Arc<Mutex<HashMap<TableId, u64>>>,
     pub listeners: Arc<RwLock<Vec<Sender<MetaStoreEvent>>>>,
-    metastore_fs: Arc<dyn MetaStoreFs>,
+    pub(crate) metastore_fs: Arc<dyn MetaStoreFs>,
     last_checkpoint_time: Arc<RwLock<SystemTime>>,
     write_notify: Arc<Notify>,
     pub(crate) write_completed_notify: Arc<Notify>,

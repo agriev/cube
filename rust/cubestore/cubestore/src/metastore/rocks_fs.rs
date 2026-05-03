@@ -48,6 +48,31 @@ pub trait MetaStoreFs: Send + Sync {
     ) -> Result<(), CubeError>;
     async fn get_snapshots_list(&self) -> Result<Vec<SnapshotInfo>, CubeError>;
     async fn write_metastore_current(&self, remote_path: &str) -> Result<(), CubeError>;
+
+    /// HA fork — upload a single raft snapshot file to remote storage
+    /// under the well-known prefix `raft-snapshots/`. Used by
+    /// `RaftMetaStore::trigger_snapshot` to ship `snapshot.bin` to S3
+    /// once it's durable on local disk.
+    ///
+    /// `local_path` is the absolute path to the file to upload
+    /// (typically `<raft-log>/snapshot.bin`). `remote_name` is the
+    /// leaf name to use on the remote — typically a fixed `latest.bin`
+    /// (we only retain one snapshot at a time, mirroring the local
+    /// retention policy in `RaftStorage::save_snapshot`).
+    ///
+    /// Default impl returns an error so impls that don't speak the
+    /// remote-fs layer (mocks, in-memory test stubs) don't have to
+    /// implement this. Production `BaseRocksStoreFs` overrides.
+    async fn upload_raft_snapshot_file(
+        &self,
+        _local_path: PathBuf,
+        _remote_name: String,
+    ) -> Result<u64, CubeError> {
+        Err(CubeError::internal(
+            "upload_raft_snapshot_file not supported by this MetaStoreFs"
+                .to_string(),
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -588,6 +613,50 @@ impl MetaStoreFs for BaseRocksStoreFs {
             )
             .await?;
         Ok(())
+    }
+
+    async fn upload_raft_snapshot_file(
+        &self,
+        local_path: PathBuf,
+        remote_name: String,
+    ) -> Result<u64, CubeError> {
+        // Stage to the uploads dir as the existing upload paths do —
+        // `RemoteFs::upload_file` consumes the staged file via rename
+        // (or moves it to S3 and unlinks). Copying first means our
+        // caller's file isn't disturbed.
+        let uploads_dir = self.remote_fs.uploads_dir().await?;
+        let prefix = format!("{}-raft-snapshot", self.name);
+        let (_file, staging) = cube_ext::spawn_blocking(move || {
+            tempfile::Builder::new()
+                .prefix(&prefix)
+                .tempfile_in(uploads_dir)
+        })
+        .await??
+        .into_parts();
+        let staging_path = staging.keep()?.to_path_buf();
+
+        // Sync copy (the snapshot is up to ~1 GiB; spawn_blocking
+        // keeps the tokio runtime responsive).
+        let staging_for_blocking = staging_path.clone();
+        let local_for_blocking = local_path.clone();
+        cube_ext::spawn_blocking(move || -> Result<(), CubeError> {
+            std::fs::copy(&local_for_blocking, &staging_for_blocking).map_err(|e| {
+                CubeError::internal(format!(
+                    "upload_raft_snapshot_file: copy {:?} → {:?}: {}",
+                    local_for_blocking, staging_for_blocking, e
+                ))
+            })?;
+            Ok(())
+        })
+        .await??;
+
+        let remote_path = format!("raft-snapshots/{}", remote_name);
+        self.remote_fs
+            .upload_file(
+                staging_path.to_str().unwrap().to_string(),
+                remote_path,
+            )
+            .await
     }
 }
 

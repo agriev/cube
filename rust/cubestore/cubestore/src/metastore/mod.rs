@@ -1470,6 +1470,14 @@ impl RocksMetaStore {
         self.store.db.clone()
     }
 
+    /// HA fork — M5.x accessor: the `MetaStoreFs` driving remote
+    /// snapshot/log uploads. Used by `RaftMetaStore::trigger_snapshot`
+    /// to ship the raft snapshot.bin to S3 alongside the local
+    /// persistence.
+    pub fn metastore_fs(&self) -> std::sync::Arc<dyn crate::metastore::MetaStoreFs> {
+        self.store.metastore_fs.clone()
+    }
+
     pub fn new(
         path: &Path,
         metastore_fs: Arc<dyn MetaStoreFs>,
