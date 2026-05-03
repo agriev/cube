@@ -2469,16 +2469,92 @@ impl Config {
                         )
                         .await;
 
+                    let ha_raft_peers = self.config_obj.ha_raft_peers();
+                    let ha_raft_port = self.config_obj.ha_raft_port();
                     self.injector
                         .register_typed::<dyn MetaStore, crate::raft::RaftMetaStore, _, _>(
                             async move |i| {
                                 let inner = i.get_service_typed::<RocksMetaStore>().await;
-                                crate::raft::RaftMetaStore::start_single_node(
-                                    &ha_raft_log_dir,
-                                    ha_node_id,
-                                    inner,
-                                )
-                                .expect("RaftMetaStore boot failed")
+                                if ha_raft_peers.is_empty() {
+                                    // Single-node mode: no peer set →
+                                    // run a 1-voter raft cluster. Useful
+                                    // for dev / smoke tests where you
+                                    // want HA mode wired but only one
+                                    // router pod.
+                                    crate::raft::RaftMetaStore::start_single_node(
+                                        &ha_raft_log_dir,
+                                        ha_node_id,
+                                        inner,
+                                    )
+                                    .expect("RaftMetaStore single-node boot failed")
+                                } else {
+                                    // Multi-node mode: stand up the
+                                    // production TcpTransport, bind the
+                                    // listener, and seed ConfState with
+                                    // the full peer set. The local
+                                    // node's id MUST appear in the peer
+                                    // list — otherwise raft-rs has no
+                                    // Progress entry for it and quorum
+                                    // math breaks.
+                                    if !ha_raft_peers.iter().any(|p| p.id == ha_node_id) {
+                                        panic!(
+                                            "CUBESTORE_NODE_ID={} is not present in CUBESTORE_RAFT_PEERS={:?} — \
+                                             every node must list itself in the peer set",
+                                            ha_node_id, ha_raft_peers
+                                        );
+                                    }
+
+                                    let transport = std::sync::Arc::new(
+                                        crate::raft::TcpTransport::new(),
+                                    );
+                                    for p in &ha_raft_peers {
+                                        transport.set_peer(
+                                            p.id,
+                                            format!("{}:{}", p.host, p.port),
+                                        );
+                                    }
+
+                                    let (inbound, inbound_rx) =
+                                        crate::raft::Inbound::new();
+                                    // Listen on all interfaces so peers
+                                    // dialing the headless DNS name
+                                    // resolve to whichever pod IP this
+                                    // is. Localhost-only would only
+                                    // work for the in-process tests.
+                                    let bind_addr =
+                                        format!("0.0.0.0:{}", ha_raft_port);
+                                    // Bind the listener now and drop
+                                    // the JoinHandle. tokio detaches
+                                    // tasks on JoinHandle drop — the
+                                    // accept loop keeps running for
+                                    // the life of the process.
+                                    let _ = crate::raft::spawn_listener(
+                                        bind_addr.clone(),
+                                        inbound,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        panic!(
+                                            "failed to bind raft listener on {}: {}",
+                                            bind_addr, e
+                                        )
+                                    });
+
+                                    let voters: Vec<u64> = ha_raft_peers
+                                        .iter()
+                                        .map(|p| p.id)
+                                        .collect();
+
+                                    crate::raft::RaftMetaStore::start_multi_node(
+                                        &ha_raft_log_dir,
+                                        ha_node_id,
+                                        voters,
+                                        inner,
+                                        transport,
+                                        inbound_rx,
+                                    )
+                                    .expect("RaftMetaStore multi-node boot failed")
+                                }
                             },
                         )
                         .await;

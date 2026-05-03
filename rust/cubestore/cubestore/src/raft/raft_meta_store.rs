@@ -88,8 +88,6 @@ impl RaftMetaStore {
     /// `raft_log_dir`. The caller has already constructed the local
     /// `RocksMetaStore`; we build a `RocksMetaStoreApply` from it and
     /// hand that to the Raft task.
-    ///
-    /// Multi-node boot lands in M4.
     pub fn start_single_node(
         raft_log_dir: impl AsRef<Path>,
         node_id: u64,
@@ -100,6 +98,40 @@ impl RaftMetaStore {
         // would fail the size check.
         let apply = Arc::new(RocksMetaStoreApply::new(store.clone()));
         let raft = RaftNode::start_single_node(raft_log_dir, node_id, apply)?;
+        Ok(Arc::new(Self { raft, store }))
+    }
+
+    /// Boot a multi-node `RaftMetaStore`. Caller is responsible for:
+    /// 1. Constructing a `Transport` and binding the matching listener
+    ///    (typically `TcpTransport` + `spawn_listener` for production).
+    /// 2. Wiring each peer's `Inbound` so the listener can deliver
+    ///    received messages back into this node's Raft loop.
+    /// 3. Building the `mpsc::UnboundedReceiver<Message>` paired with
+    ///    that `Inbound` and passing it here.
+    ///
+    /// The `voters` list seeds ConfState on first boot; on restart
+    /// the existing log/conf-state on disk takes over. Mutations
+    /// after boot go through raft ConfChange entries.
+    pub fn start_multi_node<T>(
+        raft_log_dir: impl AsRef<Path>,
+        node_id: u64,
+        voters: Vec<u64>,
+        store: Arc<RocksMetaStore>,
+        transport: Arc<T>,
+        inbound_rx: tokio::sync::mpsc::UnboundedReceiver<raft::eraftpb::Message>,
+    ) -> Result<Arc<Self>, RaftError>
+    where
+        T: crate::raft::transport::Transport,
+    {
+        let apply = Arc::new(RocksMetaStoreApply::new(store.clone()));
+        let raft = RaftNode::start_multi_node(
+            raft_log_dir,
+            node_id,
+            voters,
+            apply,
+            transport,
+            inbound_rx,
+        )?;
         Ok(Arc::new(Self { raft, store }))
     }
 
