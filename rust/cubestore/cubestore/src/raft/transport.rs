@@ -302,69 +302,67 @@ async fn run_recv_loop(mut sock: TcpStream, inbound: Inbound) -> std::io::Result
     }
 }
 
-/// One open TCP connection to a single peer, plus a tokio Mutex
-/// serializing concurrent sends. We avoid holding the Mutex across
-/// the connect itself so a slow DNS resolution can't stall send
-/// attempts to other peers (they get their own clients).
+/// Per-peer dial state. Originally we cached a long-lived TCP
+/// stream and reused it for every message; that broke under
+/// repeated pod restarts on real k8s — the cached stream points
+/// at the OLD pod's IP after the peer is recreated, and the
+/// kernel doesn't notice the connection is dead until ~30 s of
+/// retransmit timeouts. Raft's election cadence (10 ticks ≈ 500 ms)
+/// fires election storms much faster than that detection.
+///
+/// Current model: open a fresh TCP connection for each message.
+/// This is wasteful — ~6 connects/peer/sec at the heartbeat
+/// cadence, ~18 SYN/sec/pod for a 3-replica cluster — but it
+/// guarantees DNS is re-resolved every time and we never write
+/// into a stale socket. The mutex still serializes per-peer to
+/// preserve raft message ordering.
+///
+/// Future hardening: TCP_KEEPALIVE with aggressive intervals
+/// would let us safely reuse cached streams; that needs `socket2`
+/// added to the cubestore Cargo manifest, which is a bigger
+/// change than this fix is worth. Tracked.
 struct PeerConn {
     addr: String,
-    state: tokio::sync::Mutex<PeerConnState>,
-}
-
-enum PeerConnState {
-    Disconnected,
-    Connected(TcpStream),
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl PeerConn {
     fn new(addr: String) -> Self {
         Self {
             addr,
-            state: tokio::sync::Mutex::new(PeerConnState::Disconnected),
+            write_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     async fn send(&self, payload: Vec<u8>) -> std::io::Result<()> {
-        let mut guard = self.state.lock().await;
+        // Serialize per-peer so sends preserve raft ordering. The
+        // mutex is cheap because each send is a one-shot connect+
+        // write+drop; no long-lived state is held.
+        let _guard = self.write_lock.lock().await;
 
-        // Lazy-connect on first use, or after a previous I/O error
-        // dropped the stream. Connect timeout matches cubestore's
-        // existing TCP semantics — long enough to span k8s pod
-        // restarts but short enough that a dead peer doesn't pin
-        // a heartbeat for seconds.
-        if matches!(*guard, PeerConnState::Disconnected) {
-            let stream = tokio::time::timeout(
-                Duration::from_secs(3),
-                TcpStream::connect(&self.addr),
+        // Connect with a 3s timeout — k8s in-cluster RTT is sub-ms
+        // but DNS / pod-startup transients can stretch this. After
+        // 3 s we treat the peer as dead and let raft retry on the
+        // next heartbeat.
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(3),
+            TcpStream::connect(&self.addr),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connect timeout to {}", self.addr),
             )
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("connect timeout to {}", self.addr),
-                )
-            })??;
-            // Disable Nagle: heartbeats are small but latency-sensitive.
-            let _ = stream.set_nodelay(true);
-            *guard = PeerConnState::Connected(stream);
-        }
+        })??;
+        let _ = stream.set_nodelay(true);
 
-        let stream = match &mut *guard {
-            PeerConnState::Connected(s) => s,
-            PeerConnState::Disconnected => unreachable!(),
-        };
-
-        // Bound the write to 2 seconds. Default TCP retransmit
-        // timeout (~30s on Linux) is way too long for raft's tick
-        // budget — a peer pod restart with a new IP would pin
-        // every send to that peer for tens of seconds before the
-        // kernel gives up. 2s covers an in-cluster k8s round-trip
-        // with an order of magnitude of headroom; anything slower
-        // is treated as a dead connection so the NEXT send
-        // reconnects on a fresh socket.
-        let res = match tokio::time::timeout(
+        // Bound the write at 2 s. Heartbeats are <1 KiB and SST
+        // shipping is gated by raft-rs's max_size_per_msg = 1 MiB,
+        // both well under what 2 s of TCP can move on healthy LAN.
+        match tokio::time::timeout(
             Duration::from_secs(2),
-            write_frame(stream, &payload),
+            write_frame(&mut stream, &payload),
         )
         .await
         {
@@ -373,12 +371,7 @@ impl PeerConn {
                 std::io::ErrorKind::TimedOut,
                 format!("write timeout to {}", self.addr),
             )),
-        };
-        if res.is_err() {
-            // Drop the broken stream so the next send reconnects.
-            *guard = PeerConnState::Disconnected;
         }
-        res
     }
 }
 
