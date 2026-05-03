@@ -36,6 +36,9 @@
 //! - [x] M4.5.2 — `TcpTransport` + `spawn_listener` + 3-node-over-TCP
 //! - [x] M4.5.3 — `configure_meta_store` boot wiring through TCP
 //! - [x] M4 chaos — 20 partition cycles converge under 5s each
+//! - [x] M9.1 — operator metrics (`cs.raft.*` term, leader_id,
+//!         commit/applied index, leader_changes, proposals,
+//!         apply_duration_ms)
 //! - [ ] M5 — Snapshot + log compaction over `RemoteFs`
 
 pub mod command;
