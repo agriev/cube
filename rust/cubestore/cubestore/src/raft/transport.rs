@@ -27,7 +27,7 @@
 use async_trait::async_trait;
 use protobuf::Message as ProtobufMessage;
 use raft::eraftpb::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -85,28 +85,50 @@ impl Inbound {
 /// `RaftNode` instances. Used by every multi-node test in the raft
 /// module: no sockets, no serialization, no flake. Production uses
 /// the cuberpc-backed transport instead.
+///
+/// Semantics:
+/// - [`register`] places a peer in the routing table.
+/// - [`unregister`] is a **bidirectional** kill: messages targeting
+///   this peer are dropped (no recipient) AND messages originating
+///   from this peer are dropped (the peer is "off the network").
+///
+/// The bidirectional cut models a `kubectl delete pod --force` from
+/// the surviving peers' point of view. A one-way cut (drop to-X but
+/// keep from-X) would let the dead peer's stale heartbeats reset
+/// survivors' election timers, blocking failover; that's a real
+/// scheduler-timing flake we hit on Linux CI in the M4 push.
 pub struct LocalLoopback {
     peers: Mutex<HashMap<u64, Inbound>>,
+    /// Ids that have been `unregister`ed since the last `register`.
+    /// Outbound messages where `msg.from` is in this set are dropped
+    /// — the partitioned peer can't talk to anyone, not just its
+    /// recipients can't talk to it.
+    silenced: Mutex<HashSet<u64>>,
 }
 
 impl LocalLoopback {
     pub fn new() -> Self {
         Self {
             peers: Mutex::new(HashMap::new()),
+            silenced: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Wire up a peer. Call once per peer before any `RaftNode`
-    /// starts campaigning, or the first heartbeat will be silently
-    /// dropped.
+    /// Wire up a peer. Also lifts any prior `unregister`-induced
+    /// silencing so a healed peer can speak again. Call once per
+    /// peer before any `RaftNode` starts campaigning, or the first
+    /// heartbeat will be silently dropped.
     pub fn register(&self, node_id: u64, inbound: Inbound) {
         self.peers.lock().unwrap().insert(node_id, inbound);
+        self.silenced.lock().unwrap().remove(&node_id);
     }
 
-    /// Forget a peer — used by partition-injection tests to simulate
-    /// a network split. Subsequent sends to this id are no-ops.
+    /// Bidirectional partition: peer disappears from routing table
+    /// AND its outbound is silenced. Subsequent sends to/from this
+    /// id are no-ops until [`register`] reconnects it.
     pub fn unregister(&self, node_id: u64) {
         self.peers.lock().unwrap().remove(&node_id);
+        self.silenced.lock().unwrap().insert(node_id);
     }
 }
 
@@ -119,6 +141,18 @@ impl Default for LocalLoopback {
 #[async_trait]
 impl Transport for LocalLoopback {
     async fn send(&self, msg: Message) {
+        // Bidirectional kill check: if either the sender or the
+        // recipient has been `unregister`ed, drop. Done before the
+        // peers-map lookup so a partitioned-off leader's heartbeats
+        // never reach surviving peers (otherwise their election
+        // timers reset and failover is blocked indefinitely).
+        {
+            let silenced = self.silenced.lock().unwrap();
+            if silenced.contains(&msg.from) || silenced.contains(&msg.to) {
+                return;
+            }
+        }
+
         // Snapshot the inbound under the lock, then drop the lock
         // before calling `feed` so a slow consumer can't stall other
         // senders (it can't here — feed is non-blocking — but keeps
