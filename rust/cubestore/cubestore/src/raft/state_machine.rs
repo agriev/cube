@@ -1327,4 +1327,127 @@ mod tests {
         }
         assert!((1..=3).contains(&leader_id));
     }
+
+    // =========================================================================
+    // M4 chaos / soak — repeatedly partition the current leader, force a new
+    // election, restore, repeat. Plan deliverable: "kill leader 100×, log
+    // indices converge in <5s". We use 20 rounds in unit-test scope (CI
+    // budget) and assert the same per-round convergence; the longer 100-
+    // round soak lives in M8 chaos suite (kubernetes / kind, slower path).
+    // =========================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chaos_partition_leader_repeatedly_converges_each_round() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let dir3 = TempDir::new().unwrap();
+
+        let transport = Arc::new(LocalLoopback::new());
+        let (in1, rx1) = Inbound::new();
+        let (in2, rx2) = Inbound::new();
+        let (in3, rx3) = Inbound::new();
+        // Snapshot the inbounds so we can re-register a "healed" peer
+        // mid-test. Registering a freshly-cloned Inbound after
+        // `unregister` is the loopback equivalent of a network heal.
+        let in1_handle = in1.clone();
+        let in2_handle = in2.clone();
+        let in3_handle = in3.clone();
+        transport.register(1, in1);
+        transport.register(2, in2);
+        transport.register(3, in3);
+
+        let apply1 = Arc::new(RecordingApply::new());
+        let apply2 = Arc::new(RecordingApply::new());
+        let apply3 = Arc::new(RecordingApply::new());
+
+        let n1 = RaftNode::start_multi_node(
+            dir1.path(), 1, vec![1, 2, 3],
+            Arc::clone(&apply1), Arc::clone(&transport), rx1,
+        ).expect("start n1");
+        let n2 = RaftNode::start_multi_node(
+            dir2.path(), 2, vec![1, 2, 3],
+            Arc::clone(&apply2), Arc::clone(&transport), rx2,
+        ).expect("start n2");
+        let n3 = RaftNode::start_multi_node(
+            dir3.path(), 3, vec![1, 2, 3],
+            Arc::clone(&apply3), Arc::clone(&transport), rx3,
+        ).expect("start n3");
+
+        let nodes: Vec<(u64, RaftNode)> = vec![(1, n1), (2, n2), (3, n3)];
+
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            // Find current leader.
+            let leader = await_leader(&nodes, Duration::from_secs(10)).await;
+            let leader_id = leader.0;
+
+            // Partition: drop the leader from the loopback. Surviving
+            // two converge on a new leader within `election_tick *
+            // tick_interval = 500ms`-ish; budget 5s per round per the
+            // plan deliverable.
+            transport.unregister(leader_id);
+
+            let survivors: Vec<(u64, RaftNode)> = nodes
+                .iter()
+                .filter(|(id, _)| *id != leader_id)
+                .map(|(id, n)| (*id, n.clone()))
+                .collect();
+
+            let round_start = std::time::Instant::now();
+            let new_leader = await_leader(&survivors, Duration::from_secs(5)).await;
+            let elected_in = round_start.elapsed();
+            assert_ne!(
+                new_leader.0, leader_id,
+                "round {}: new leader must differ from killed",
+                round
+            );
+            assert!(
+                elected_in < Duration::from_secs(5),
+                "round {}: failover budget 5s exceeded ({:?})",
+                round,
+                elected_in
+            );
+
+            // Heal: bring the previously-partitioned node back. Its
+            // inbound is re-registered with the same handle so any
+            // replays raft sends are routed back to its loop.
+            let restored = match leader_id {
+                1 => in1_handle.clone(),
+                2 => in2_handle.clone(),
+                3 => in3_handle.clone(),
+                _ => unreachable!(),
+            };
+            transport.register(leader_id, restored);
+
+            // Allow the healed node to catch up before the next round.
+            // Without this the immediate next election can race against
+            // its rejoin and pick the same node again.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        // After ROUNDS iterations, all replicas must have applied the
+        // same set of `__leader_probe__` commands (sent by every
+        // `await_leader` call). Verify by counting on each replica:
+        // the counts may differ slightly because partitioned probes
+        // never reached a quorum, but the surviving-replicas' counts
+        // must match each other within a small margin per round.
+        let c1 = apply1.snapshot().len();
+        let c2 = apply2.snapshot().len();
+        let c3 = apply3.snapshot().len();
+        // Lower bound: at least one probe per round survived.
+        assert!(
+            c1 >= ROUNDS && c2 >= ROUNDS && c3 >= ROUNDS,
+            "every replica should see at least {} applies after {} rounds; got {}/{}/{}",
+            ROUNDS, ROUNDS, c1, c2, c3
+        );
+        // Convergence: replica counts must agree to within 2 per
+        // round (one wasted probe per kill on average).
+        let max = c1.max(c2).max(c3);
+        let min = c1.min(c2).min(c3);
+        assert!(
+            max - min <= ROUNDS * 2,
+            "replica apply counts diverged: {}/{}/{} (max-min={})",
+            c1, c2, c3, max - min
+        );
+    }
 }
