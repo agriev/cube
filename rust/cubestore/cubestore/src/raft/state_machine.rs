@@ -1225,4 +1225,106 @@ mod tests {
             "new leader must be a surviving node, not the killed one"
         );
     }
+
+    // =========================================================================
+    // M4.5.2 — production TCP transport end-to-end
+    // =========================================================================
+    //
+    // The same 3-node consensus that worked over `LocalLoopback` MUST
+    // also work when each node ships its messages through real
+    // localhost TCP sockets. This catches framing bugs, deadlocks
+    // between the listener and dialer, and protobuf-codec drift that
+    // the in-memory loopback can't.
+
+    use crate::raft::transport::{spawn_listener, TcpTransport};
+    use tokio::net::TcpListener;
+
+    async fn alloc_addr() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        drop(l);
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_node_cluster_over_real_tcp_replicates_writes() {
+        // Allocate 3 ephemeral ports.
+        let addr1 = alloc_addr().await;
+        let addr2 = alloc_addr().await;
+        let addr3 = alloc_addr().await;
+
+        // Each node has its own TcpTransport and its own listener+inbound.
+        let transport1 = Arc::new(TcpTransport::new());
+        let transport2 = Arc::new(TcpTransport::new());
+        let transport3 = Arc::new(TcpTransport::new());
+        for t in [&transport1, &transport2, &transport3] {
+            t.set_peer(1, addr1.clone());
+            t.set_peer(2, addr2.clone());
+            t.set_peer(3, addr3.clone());
+        }
+
+        let (in1, rx1) = Inbound::new();
+        let (in2, rx2) = Inbound::new();
+        let (in3, rx3) = Inbound::new();
+        let _h1 = spawn_listener(addr1.clone(), in1).await.expect("bind 1");
+        let _h2 = spawn_listener(addr2.clone(), in2).await.expect("bind 2");
+        let _h3 = spawn_listener(addr3.clone(), in3).await.expect("bind 3");
+
+        // Wait for all three listeners to be accept-ready.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let dir3 = TempDir::new().unwrap();
+
+        let apply1 = Arc::new(RecordingApply::new());
+        let apply2 = Arc::new(RecordingApply::new());
+        let apply3 = Arc::new(RecordingApply::new());
+
+        let n1 = RaftNode::start_multi_node(
+            dir1.path(), 1, vec![1, 2, 3],
+            Arc::clone(&apply1), Arc::clone(&transport1), rx1,
+        ).expect("start n1");
+        let n2 = RaftNode::start_multi_node(
+            dir2.path(), 2, vec![1, 2, 3],
+            Arc::clone(&apply2), Arc::clone(&transport2), rx2,
+        ).expect("start n2");
+        let n3 = RaftNode::start_multi_node(
+            dir3.path(), 3, vec![1, 2, 3],
+            Arc::clone(&apply3), Arc::clone(&transport3), rx3,
+        ).expect("start n3");
+
+        let nodes = vec![(1u64, n1), (2u64, n2), (3u64, n3)];
+        let leader = await_leader(&nodes, Duration::from_secs(20)).await;
+        let leader_id = leader.0;
+
+        let cmd = MetaCommand::CreateSchema {
+            schema_name: "real_tcp_write".into(),
+            if_not_exists: false,
+        };
+        tokio::time::timeout(Duration::from_secs(10), leader.1.propose(cmd.clone()))
+            .await
+            .expect("propose timed out")
+            .expect("propose at TCP leader failed");
+
+        // Followers' apply path needs a moment to drain after commit.
+        // TCP is heavier than loopback so 1s headroom is appropriate.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        for (id, _) in &nodes {
+            let recorded = match *id {
+                1 => apply1.snapshot(),
+                2 => apply2.snapshot(),
+                3 => apply3.snapshot(),
+                _ => unreachable!(),
+            };
+            let after = recorded.iter().filter(|c| **c == cmd).count();
+            assert_eq!(
+                after, 1,
+                "TCP replica {} must apply real_tcp_write exactly once (saw {})",
+                id, after
+            );
+        }
+        assert!((1..=3).contains(&leader_id));
+    }
 }

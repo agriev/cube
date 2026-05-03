@@ -44,4 +44,4 @@ pub mod transport;
 
 pub use command::{MetaCommand, MetaCommandCodecError};
 pub use raft_meta_store::RaftMetaStore;
-pub use transport::{Inbound, LocalLoopback, Transport};
+pub use transport::{spawn_listener, Inbound, LocalLoopback, TcpTransport, Transport};
