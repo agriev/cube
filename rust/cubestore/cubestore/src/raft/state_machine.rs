@@ -118,6 +118,10 @@ struct Proposal {
 #[derive(Clone)]
 pub struct RaftNode {
     proposals: mpsc::UnboundedSender<Proposal>,
+    /// Keep a clone of the storage so the wrapper (`RaftMetaStore`)
+    /// can read back applied/snapshot indices and persist new
+    /// snapshots without waking the raft tick loop. M5.4.
+    storage: SharedRaftStorage,
 }
 
 /// What kind of cluster this node is part of. Drives bootstrap-time
@@ -241,11 +245,20 @@ impl RaftNode {
         // monomorphized per-T explosions get noisy).
         let transport_dyn: Arc<dyn Transport> = transport;
 
+        // Keep a clone of the storage handle so the public `storage()`
+        // method (M5.4 — used by the snapshot trigger) can read back
+        // applied / snapshot indices without going through the tick
+        // loop.
+        let storage_for_self = storage.clone();
+
         tokio::spawn(run_node(
             raw, storage, rx, apply, pending, logger, transport_dyn, inbound_rx, kind,
         ));
 
-        Ok(Self { proposals: tx })
+        Ok(Self {
+            proposals: tx,
+            storage: storage_for_self,
+        })
     }
 
     /// Propose a command and resolve the future once it has applied.
@@ -259,6 +272,13 @@ impl RaftNode {
             .map_err(|_| CubeError::internal("raft task is not running".to_string()))?;
         rx.await
             .map_err(|_| CubeError::internal("raft task dropped the response channel".to_string()))?
+    }
+
+    /// M5.4 — handle to the underlying storage so the snapshot
+    /// trigger can read applied/snapshot indices and persist new
+    /// snapshots without contending the raft tick loop.
+    pub fn storage(&self) -> SharedRaftStorage {
+        self.storage.clone()
     }
 }
 

@@ -536,6 +536,13 @@ impl SharedRaftStorage {
     pub fn snapshot_index(&self) -> Result<u64, RaftStorageError> {
         self.0.snapshot_index()
     }
+
+    /// Read the cached ConfState. Used by the M5.4 snapshot trigger
+    /// to populate Snapshot.metadata.conf_state without going through
+    /// `Storage::initial_state` (which also returns HardState).
+    pub fn read_conf_state(&self) -> ConfState {
+        self.0.conf_state.read().unwrap().clone()
+    }
 }
 
 impl Storage for SharedRaftStorage {

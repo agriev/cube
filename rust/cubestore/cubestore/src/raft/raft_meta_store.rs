@@ -142,6 +142,77 @@ impl RaftMetaStore {
         &self.store
     }
 
+    /// M5.4 — explicit snapshot trigger.
+    ///
+    /// 1. Reads the current `applied_index` from the raft storage.
+    /// 2. Reads the current ConfState (and looks up the term for
+    ///    that index from the log).
+    /// 3. Calls `build_state_machine_snapshot_bytes` against the
+    ///    live `RocksMetaStore` to produce the data payload.
+    /// 4. Persists the full Snapshot via `storage.save_snapshot`.
+    ///
+    /// `staging_root` is where the temporary RocksDB checkpoint dir
+    /// lives during the build (typically the same dir as the raft
+    /// log, so it stays on the same FS).
+    ///
+    /// Does NOT compact the log — that's M5.5 and runs as a follow-
+    /// up step the caller invokes once the snapshot is durable. The
+    /// split lets the caller decide a compaction strategy (e.g.
+    /// keep N entries past the snapshot for late stragglers).
+    ///
+    /// Idempotent against concurrent callers via the mpsc serialization
+    /// in raft_storage's underlying RwLock semantics — but the caller
+    /// is expected to invoke this from a single janitor task (M5.4
+    /// follow-up will add the timer-driven version).
+    pub async fn trigger_snapshot(
+        &self,
+        staging_root: &std::path::Path,
+    ) -> Result<(), CubeError> {
+        use crate::raft::snapshot_builder;
+        use raft::Storage;
+
+        let storage = self.raft.storage();
+
+        // Snapshot the current view of the state machine. The
+        // applied_index here may advance between this read and the
+        // checkpoint call below — that's fine, the checkpoint is a
+        // RocksDB-level snapshot of whatever rows have committed by
+        // the time it runs, and we record THAT index as the metadata.
+        let applied = storage
+            .applied_index()
+            .map_err(|e| CubeError::internal(format!("read applied_index: {}", e)))?
+            .unwrap_or(0);
+
+        // Storage::term may return Compacted / Unavailable errors
+        // for indices outside the current log range. For applied=0
+        // (no entries yet) we use term=0; that's a valid snapshot
+        // metadata for an "empty cluster" state.
+        let term = Storage::term(&storage, applied).unwrap_or(0);
+
+        // ConfState comes from the storage's cached value. raft-rs
+        // updates it via `set_conf_state` whenever a ConfChange
+        // entry applies.
+        let conf_state = storage.read_conf_state();
+
+        // Build the state-machine bytes via M5.3.
+        let data =
+            snapshot_builder::build_state_machine_snapshot_bytes(&self.store, staging_root)
+                .await?;
+
+        // Persist via M5.1.
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        let meta = snapshot.mut_metadata();
+        meta.index = applied;
+        meta.term = term;
+        meta.set_conf_state(conf_state);
+        snapshot.set_data(data.into());
+
+        storage
+            .save_snapshot(&snapshot)
+            .map_err(|e| CubeError::internal(format!("save_snapshot: {}", e)))?;
+        Ok(())
+    }
+
     fn mismatch(method: &'static str, e: MetaCommandResultMismatch) -> CubeError {
         CubeError::internal(format!(
             "RaftMetaStore::{} — apply produced a wrong result shape: {}",
@@ -1387,6 +1458,75 @@ mod tests {
             .await
             .expect("all_jobs");
         assert!(remaining.is_empty(), "queue must be empty after delete");
+
+        cleanup(&sp, &rp);
+    }
+
+    // =========================================================================
+    // M5.4 — explicit snapshot trigger end-to-end
+    // =========================================================================
+    //
+    // Drives a full snapshot through the production wrapper:
+    // - apply some writes through the MetaStore trait
+    // - call trigger_snapshot
+    // - read back via storage.read_snapshot
+    // - assert metadata matches the applied state and data is non-empty
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trigger_snapshot_persists_metadata_and_data() {
+        let (wrapper, sp, rp, raft_dir) =
+            setup_wrapper("raft_trigger_snapshot_smoke");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Plant some state through the trait so the snapshot has
+        // something non-trivial to capture.
+        for n in &["alpha", "beta", "gamma"] {
+            wrapper
+                .create_schema(n.to_string(), false)
+                .await
+                .expect("create schema");
+        }
+
+        // Build + persist the snapshot. Staging dir lives next to
+        // the raft log so we don't cross filesystems.
+        let staging = raft_dir.path().join("snapshot-staging");
+        wrapper
+            .trigger_snapshot(&staging)
+            .await
+            .expect("trigger_snapshot");
+
+        // Read it back via the underlying storage (M5.1).
+        use raft::Storage;
+        let storage = wrapper.raft.storage();
+        let snap = storage
+            .read_snapshot()
+            .expect("read_snapshot")
+            .expect("snapshot must be present after trigger");
+
+        // Metadata should reflect a non-trivial applied index — at
+        // least one entry per CreateSchema command was committed.
+        // ConfState voters: single-node = [1].
+        let meta = snap.get_metadata();
+        assert!(
+            meta.index >= 3,
+            "snapshot index should be >= 3 (one per create_schema), got {}",
+            meta.index
+        );
+        assert_eq!(meta.get_conf_state().voters, vec![1]);
+
+        // Data should be the packed RocksDB checkpoint — non-empty
+        // and large enough to contain at least the CURRENT marker
+        // (~16 bytes) plus a MANIFEST.
+        assert!(
+            snap.get_data().len() > 100,
+            "snapshot data suspiciously small: {} bytes",
+            snap.get_data().len()
+        );
+
+        // Storage::snapshot must satisfy any request_index up to the
+        // current snapshot.index.
+        let s = Storage::snapshot(&storage, meta.index, 0).expect("snapshot");
+        assert_eq!(s.get_metadata().index, meta.index);
 
         cleanup(&sp, &rp);
     }
