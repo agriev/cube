@@ -409,17 +409,42 @@ async fn run_node<A: Apply>(
                                 continue;
                             }
                         };
-                        // Followers can't accept proposals — raft-rs
-                        // returns `ProposalDropped`. Surface that as
-                        // a routable error so the wrapping
-                        // `RaftMetaStore` can decide to forward to the
-                        // leader (M4.5) or fail back to the caller.
+                        // raft-rs auto-forwards `MsgPropose` from a
+                        // follower to the leader, so a propose on
+                        // a non-leader replica usually succeeds
+                        // transparently — the entry commits and
+                        // applies via the normal MsgAppend path.
+                        // raft-rs only returns ProposalDropped when
+                        // it CAN'T forward (no leader currently
+                        // known, e.g. mid-election or partitioned
+                        // off the quorum). M6.2 surfaces a leader
+                        // hint in that error so a smart client can
+                        // redirect or back off rather than retry
+                        // blindly: `raft-leader-id=N` is the
+                        // parseable marker.
                         let next_index = raw.raft.raft_log.last_index() + 1;
                         if let Err(e) = raw.propose(vec![], bytes) {
                             crate::app_metrics::RAFT_PROPOSALS_FAILED.increment();
-                            let _ = p.respond_to.send(Err(CubeError::internal(format!(
-                                "raft propose failed: {:?}", e
-                            ))));
+                            let leader_hint = raw.raft.leader_id;
+                            let detail = if leader_hint == 0 {
+                                "no leader currently elected (election in progress?)"
+                                    .to_string()
+                            } else if leader_hint == raw.raft.id {
+                                // Should never happen — leader can
+                                // always propose. Surface it as a
+                                // bug.
+                                format!(
+                                    "this node IS leader (id={}) but propose failed: {:?}",
+                                    leader_hint, e
+                                )
+                            } else {
+                                format!(
+                                    "this node is a follower; leader \
+                                     raft-leader-id={} (raft propose: {:?})",
+                                    leader_hint, e
+                                )
+                            };
+                            let _ = p.respond_to.send(Err(CubeError::internal(detail)));
                             continue;
                         }
                         crate::app_metrics::RAFT_PROPOSALS_SUCCESS.increment();
@@ -1751,5 +1776,96 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    // =========================================================================
+    // M6.2 — propose against a leaderless cluster returns a hint
+    // =========================================================================
+    //
+    // We don't test "follower rejects propose" directly: raft-rs
+    // auto-forwards MsgPropose to the leader, so a propose on any
+    // healthy non-leader transparently succeeds via MsgAppend.
+    //
+    // The leader-hint code path fires only when raft-rs's step()
+    // returns ProposalDropped — i.e. when this replica doesn't
+    // know who the leader is. To exercise that we boot a 3-node
+    // cluster and partition each node from the others *before*
+    // any election can complete, then propose. Quorum is 2/3, so
+    // with everyone partitioned no leader emerges; the propose
+    // must fail. The error is the "no leader currently elected"
+    // form (no `raft-leader-id=` marker) — we verify that path
+    // and the parser handles it correctly.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leaderless_propose_error_has_no_leader_hint() {
+        use crate::raft::raft_meta_store::RaftMetaStore;
+
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let dir3 = TempDir::new().unwrap();
+
+        // Build a transport where every node is silenced. No vote
+        // exchange can succeed → no quorum → no leader.
+        let transport = Arc::new(LocalLoopback::new());
+        let (in1, rx1) = Inbound::new();
+        let (in2, rx2) = Inbound::new();
+        let (in3, rx3) = Inbound::new();
+        transport.register(1, in1);
+        transport.register(2, in2);
+        transport.register(3, in3);
+        transport.unregister(1);
+        transport.unregister(2);
+        transport.unregister(3);
+
+        let apply1 = Arc::new(RecordingApply::new());
+        let apply2 = Arc::new(RecordingApply::new());
+        let apply3 = Arc::new(RecordingApply::new());
+
+        let n1 = RaftNode::start_multi_node(
+            dir1.path(), 1, vec![1, 2, 3],
+            Arc::clone(&apply1), Arc::clone(&transport), rx1,
+        ).expect("start n1");
+        let _n2 = RaftNode::start_multi_node(
+            dir2.path(), 2, vec![1, 2, 3],
+            Arc::clone(&apply2), Arc::clone(&transport), rx2,
+        ).expect("start n2");
+        let _n3 = RaftNode::start_multi_node(
+            dir3.path(), 3, vec![1, 2, 3],
+            Arc::clone(&apply3), Arc::clone(&transport), rx3,
+        ).expect("start n3");
+
+        // Give the nodes a moment to thrash on elections that won't
+        // succeed — they'll all be Candidates with no quorum.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            n1.current_leader_id(),
+            None,
+            "no leader should be elected with everyone partitioned"
+        );
+
+        // Propose on n1 → step returns ProposalDropped → our error
+        // path runs; leader_id is 0 so the message is the
+        // "no leader currently elected" form (no `raft-leader-id=`).
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            n1.propose(MetaCommand::CreateSchema {
+                schema_name: "no-leader".into(),
+                if_not_exists: false,
+            }),
+        )
+        .await
+        .expect("propose should not hang")
+        .expect_err("propose must fail in a leaderless cluster");
+
+        assert!(
+            err.message.contains("no leader currently elected"),
+            "expected no-leader hint, got: {}",
+            err.message
+        );
+        assert_eq!(
+            RaftMetaStore::parse_leader_hint(&err),
+            None,
+            "parser must return None when there's no marker",
+        );
     }
 }

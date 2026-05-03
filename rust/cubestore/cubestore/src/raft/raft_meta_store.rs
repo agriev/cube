@@ -161,6 +161,29 @@ impl RaftMetaStore {
         self.raft.self_id()
     }
 
+    /// M6.2 — extract a `raft-leader-id=N` hint from a propose
+    /// error message. Returns `None` if the error doesn't contain
+    /// the marker (e.g. "no leader currently elected" during an
+    /// election). The error format is stable: `raft-leader-id=N`
+    /// where N is a u64 in decimal.
+    ///
+    /// A retry-aware client uses this to redirect the failed
+    /// write to the leader. Without the marker the client should
+    /// back off (the cluster is mid-election).
+    pub fn parse_leader_hint(err: &CubeError) -> Option<u64> {
+        let msg = &err.message;
+        let needle = "raft-leader-id=";
+        let idx = msg.find(needle)?;
+        let tail = &msg[idx + needle.len()..];
+        let end = tail
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        if end == 0 {
+            return None;
+        }
+        tail[..end].parse::<u64>().ok()
+    }
+
     /// M5.4 + M5.5 — explicit snapshot trigger with log compaction.
     ///
     /// 1. Reads the current `applied_index` from the raft storage.
@@ -1577,6 +1600,37 @@ mod tests {
         assert_eq!(s.get_metadata().index, meta.index);
 
         cleanup(&sp, &rp);
+    }
+
+    // =========================================================================
+    // M6.2 — leader-hint parser unit tests
+    // =========================================================================
+
+    #[test]
+    fn parse_leader_hint_extracts_decimal_id() {
+        let err = CubeError::internal(
+            "this node is a follower; leader raft-leader-id=2 (raft propose: ProposalDropped)"
+                .into(),
+        );
+        assert_eq!(RaftMetaStore::parse_leader_hint(&err), Some(2));
+    }
+
+    #[test]
+    fn parse_leader_hint_handles_id_at_eol() {
+        let err = CubeError::internal("see raft-leader-id=42".into());
+        assert_eq!(RaftMetaStore::parse_leader_hint(&err), Some(42));
+    }
+
+    #[test]
+    fn parse_leader_hint_returns_none_when_marker_missing() {
+        let err = CubeError::internal("no leader currently elected".into());
+        assert_eq!(RaftMetaStore::parse_leader_hint(&err), None);
+    }
+
+    #[test]
+    fn parse_leader_hint_returns_none_for_garbage_value() {
+        let err = CubeError::internal("raft-leader-id=abc".into());
+        assert_eq!(RaftMetaStore::parse_leader_hint(&err), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
