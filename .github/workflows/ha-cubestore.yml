@@ -81,11 +81,22 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install Linux build prereqs (cmake, sasl, libclang, etc.)
+        # Probe for everything before invoking sudo. On the self-hosted
+        # runner the prereqs are already installed from prior runs, and an
+        # earlier run hung for 90 minutes inside `sudo apt-get` (likely
+        # held dpkg lock or NOPASSWD policy quirk). Skip apt entirely on
+        # the happy path.
         run: |
-          # Self-hosted runner: prereqs may already be present;
-          # `|| true` makes the step idempotent across runs.
-          sudo apt-get update -qq || true
-          sudo apt-get install -y --no-install-recommends \
+          have() { command -v "$1" >/dev/null 2>&1; }
+          libs() { pkg-config --exists "$@" 2>/dev/null; }
+          if have cmake && have cc && have clang && have pkg-config \
+             && libs openssl libsasl2 libpq liblz4 libzstd; then
+            echo "Build prereqs already present, skipping apt-get."
+            exit 0
+          fi
+          # Cap apt at 10 minutes so a stuck dpkg lock fails loud, not silent.
+          timeout 600 sudo apt-get update -qq || true
+          timeout 600 sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config \
             libssl-dev libsasl2-dev libpq-dev liblz4-dev libzstd-dev \
             clang libclang-dev || true
@@ -196,9 +207,18 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install Linux build prereqs
+        # Same skip-if-present guard as cubestore-check. Avoids the dpkg-lock
+        # stall that previously cancelled this runner after 90 min.
         run: |
-          sudo apt-get update -qq || true
-          sudo apt-get install -y --no-install-recommends \
+          have() { command -v "$1" >/dev/null 2>&1; }
+          libs() { pkg-config --exists "$@" 2>/dev/null; }
+          if have cmake && have cc && have clang && have pkg-config \
+             && libs openssl libsasl2 libpq liblz4 libzstd; then
+            echo "Build prereqs already present, skipping apt-get."
+            exit 0
+          fi
+          timeout 600 sudo apt-get update -qq || true
+          timeout 600 sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config \
             libssl-dev libsasl2-dev libpq-dev liblz4-dev libzstd-dev \
             clang libclang-dev || true
