@@ -358,6 +358,82 @@ impl RaftStorage {
         Ok(meta.map(|m| m.index).unwrap_or(0))
     }
 
+    /// M5.6 — Install an inbound snapshot received from a leader via
+    /// `MsgSnapshot`. Mirrors raft-rs's `MemStorage::apply_snapshot`:
+    ///
+    /// 1. Refuse if the snapshot is older than what we already have
+    ///    (`SnapshotOutOfDate` to raft-rs).
+    /// 2. Persist the snapshot data + metadata via `save_snapshot`.
+    /// 3. Update HardState (term and commit advance to the snapshot
+    ///    point) and ConfState (replicas list as of that snapshot).
+    /// 4. Clear the log: any entries currently held are by definition
+    ///    older than the snapshot's index. After this call the log is
+    ///    seeded with a single zero-entry pointing at the snapshot
+    ///    so `first_index() == snapshot.index + 1`.
+    ///
+    /// **State-machine side**: the caller is responsible for
+    /// rehydrating the application state from `snapshot.data`. For
+    /// our codebase that means unpacking the bytes via
+    /// `snapshot_payload::unpack_dir` and either swapping the live
+    /// RocksMetaStore (M5.6 follow-up) or restarting the process so
+    /// the snapshot dir gets picked up on the boot path. This
+    /// function only updates raft-side metadata.
+    pub fn apply_snapshot(&self, snapshot: Snapshot) -> Result<(), RaftStorageError> {
+        let new_index = snapshot.get_metadata().index;
+        let new_term = snapshot.get_metadata().term;
+        let new_conf = snapshot.get_metadata().get_conf_state().clone();
+
+        // Reject stale snapshots — raft-rs uses the SnapshotOutOfDate
+        // error semantically here, but we surface it as a domain
+        // error since the storage trait doesn't go through this path
+        // (apply_snapshot is invoked by the application, not by raft-rs
+        // calling Storage::apply_snapshot).
+        let cur_index = self.snapshot_index()?;
+        if new_index < cur_index {
+            return Err(RaftStorageError::Inconsistent(format!(
+                "apply_snapshot: stale snapshot {} < current {}",
+                new_index, cur_index
+            )));
+        }
+
+        // 1. Persist the new snapshot (data + metadata).
+        self.save_snapshot(&snapshot)?;
+
+        // 2. Update HardState — term advances; commit jumps to the
+        //    snapshot's index since everything up to it is applied.
+        let mut hs = self.hard_state.read().unwrap().clone();
+        hs.term = std::cmp::max(hs.term, new_term);
+        hs.commit = std::cmp::max(hs.commit, new_index);
+        self.set_hard_state(hs)?;
+
+        // 3. Update ConfState — peers as of the snapshot.
+        self.set_conf_state(new_conf)?;
+
+        // 4. Clear log entries — they're all ≤ snapshot.index now.
+        //    Then re-seed a placeholder zero-entry at snapshot.index
+        //    so `first_index()` and `last_index()` report sane values.
+        let cf_e = self
+            .db
+            .cf_handle(CF_ENTRIES)
+            .ok_or_else(|| RaftStorageError::Inconsistent("entries CF missing".into()))?;
+        let mut wb = WriteBatch::default();
+        // Range delete: drop EVERYTHING.
+        wb.delete_range_cf(cf_e, &index_key(0), &index_key(u64::MAX));
+        // Seed a sentinel so first_index_internal has something to
+        // return. Mirrors the boot-time zero-entry contract.
+        let mut sentinel = Entry::default();
+        sentinel.index = new_index;
+        sentinel.term = new_term;
+        wb.put_cf(cf_e, &index_key(new_index), sentinel.write_to_bytes()?);
+        self.db.write_opt(wb, &sync_write())?;
+
+        // 5. applied_index advances to the snapshot point too —
+        //    everything up to here is by definition applied.
+        self.set_applied_index(new_index)?;
+
+        Ok(())
+    }
+
     fn first_index_internal(&self) -> Result<u64, RaftStorageError> {
         let cf_e = self
             .db
@@ -535,6 +611,10 @@ impl SharedRaftStorage {
 
     pub fn snapshot_index(&self) -> Result<u64, RaftStorageError> {
         self.0.snapshot_index()
+    }
+
+    pub fn apply_snapshot(&self, snapshot: Snapshot) -> Result<(), RaftStorageError> {
+        self.0.apply_snapshot(snapshot)
     }
 
     /// Read the cached ConfState. Used by the M5.4 snapshot trigger
@@ -948,5 +1028,87 @@ mod tests {
             !tmp.exists(),
             "tmp sidecar must be cleaned up after save_snapshot"
         );
+    }
+
+    // ----------------------------------------------------------
+    // M5.6 — apply_snapshot (inbound from leader)
+    // ----------------------------------------------------------
+
+    #[test]
+    fn apply_snapshot_updates_meta_and_clears_log() {
+        let dir = TempDir::new().unwrap();
+        let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+
+        // Seed the log with a few entries that will get blown away
+        // by the inbound snapshot.
+        let mut e1 = Entry::default();
+        e1.index = 1;
+        e1.term = 1;
+        let mut e2 = Entry::default();
+        e2.index = 2;
+        e2.term = 1;
+        s.append(&[e1, e2]).unwrap();
+        assert_eq!(s.last_index().unwrap(), 2);
+
+        // Inbound snapshot at index 50 with term 7 and a new
+        // 3-voter cluster (e.g. simulating that the cluster grew
+        // while this replica was offline).
+        let snap = make_snapshot(50, 7, vec![1, 2, 3], b"new-state");
+        s.apply_snapshot(snap).unwrap();
+
+        // Old log entries are gone; first_index and last_index
+        // both point at the snapshot index.
+        assert_eq!(s.first_index_internal().unwrap(), 50);
+        assert_eq!(s.last_index().unwrap(), 50);
+
+        // ConfState updated.
+        assert_eq!(
+            s.conf_state.read().unwrap().voters,
+            vec![1, 2, 3]
+        );
+
+        // HardState: term advanced, commit jumped.
+        let hs = s.hard_state.read().unwrap().clone();
+        assert!(hs.term >= 7);
+        assert!(hs.commit >= 50);
+
+        // applied_index advanced.
+        assert_eq!(s.applied_index().unwrap(), Some(50));
+
+        // The persisted snapshot is the inbound one — round-trip.
+        let read = s.read_snapshot().unwrap().unwrap();
+        assert_eq!(read.get_metadata().index, 50);
+        assert_eq!(read.get_data(), b"new-state");
+    }
+
+    #[test]
+    fn apply_snapshot_rejects_older_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+
+        s.apply_snapshot(make_snapshot(100, 5, vec![1], b"newest"))
+            .unwrap();
+        // Now try to apply an OLDER snapshot — must reject.
+        let stale = make_snapshot(50, 3, vec![1], b"stale");
+        let err = s.apply_snapshot(stale).unwrap_err();
+        assert!(format!("{}", err).contains("stale snapshot"));
+    }
+
+    #[test]
+    fn apply_snapshot_persists_across_open() {
+        let dir = TempDir::new().unwrap();
+        {
+            let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+            s.apply_snapshot(make_snapshot(33, 4, vec![1, 2], b"persist"))
+                .unwrap();
+        }
+        // Re-open. Storage::initial_state must reflect the inbound
+        // snapshot's HardState + ConfState.
+        let s2 = RaftStorage::open(dir.path(), vec![1, 2]).unwrap();
+        let rs = s2.initial_state().unwrap();
+        assert!(rs.hard_state.term >= 4);
+        assert!(rs.hard_state.commit >= 33);
+        assert_eq!(rs.conf_state.voters, vec![1, 2]);
+        assert_eq!(s2.applied_index().unwrap(), Some(33));
     }
 }
