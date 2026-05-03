@@ -415,6 +415,41 @@ async fn drive_ready<A: Apply>(
     }
     let mut ready = raw.ready();
 
+    // M5.6 — Inbound snapshot install. raft-rs sets ready.snapshot
+    // when this replica was so far behind the leader's log that the
+    // leader sent it a full snapshot via MsgSnapshot instead of
+    // MsgAppend. Apply it FIRST: the log entries / hardstate / etc.
+    // that raft-rs is about to hand us in this Ready are based on
+    // the post-snapshot state, so we must reseed the storage before
+    // touching anything else.
+    //
+    // NOTE: storage.apply_snapshot wipes the log AND updates
+    // HardState/ConfState/applied_index. The state-machine bytes
+    // (raft-snapshot.data) carry the application's RocksMetaStore
+    // payload — for this commit we only persist them via the
+    // storage layer; the in-process RocksMetaStore swap that lets
+    // queries see the new state without a process restart is the
+    // M5.6.3 follow-up.
+    if !raft::is_empty_snap(ready.snapshot()) {
+        let snap = ready.snapshot().clone();
+        let snap_index = snap.get_metadata().index;
+        match storage.apply_snapshot(snap) {
+            Ok(()) => {
+                log::info!(
+                    "raft: applied inbound snapshot at index {}",
+                    snap_index
+                );
+            }
+            Err(e) => {
+                // A failed snapshot install leaves the storage in
+                // an undefined state. Crash-loop the task so k8s
+                // restarts the pod from the on-disk state, which
+                // by save_snapshot's atomicity is still consistent.
+                panic!("raft storage apply_snapshot failed: {}", e);
+            }
+        }
+    }
+
     // 1. Persist log entries to RocksDB. fsync-before-ack is enabled
     //    inside RaftStorage::append (correctness requirement).
     if !ready.entries().is_empty() {
