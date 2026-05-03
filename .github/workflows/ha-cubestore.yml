@@ -24,6 +24,16 @@ on:
 permissions:
   contents: read
 
+# When a new push lands on ha-main (or PR target) cancel the in-flight
+# run for the same ref and start fresh. Without this the self-hosted
+# runner queue piles up — each run takes ~30 min on linux/x64 and
+# ~12 min on macos-arm64, so a flurry of small commits would otherwise
+# take hours to drain. We accept that the cancelled-run logs are
+# lost; the latest run is the source of truth anyway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Fast feedback: codec / unit tests of the new raft module in isolation.
   # The mini-crate has no upstream-cubestore deps, so it's seconds to compile.
