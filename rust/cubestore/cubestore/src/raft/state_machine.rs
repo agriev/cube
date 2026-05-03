@@ -381,7 +381,7 @@ async fn run_node<A: Apply>(
             );
         }
     }
-    drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+    drive_ready(&mut raw, &storage, &apply, &mut pending, &transport).await;
 
     // Track the last leader id we saw so we can increment the
     // leader-changes counter on transitions. 0 (raft-rs's "no leader"
@@ -393,7 +393,7 @@ async fn run_node<A: Apply>(
         tokio::select! {
             _ = tick.tick() => {
                 raw.tick();
-                drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+                drive_ready(&mut raw, &storage, &apply, &mut pending, &transport).await;
                 publish_raft_metrics(&raw, &mut last_leader_id, &current_leader_id);
             }
             maybe = proposals.recv() => {
@@ -449,7 +449,7 @@ async fn run_node<A: Apply>(
                         }
                         crate::app_metrics::RAFT_PROPOSALS_SUCCESS.increment();
                         pending.insert(next_index, p.respond_to);
-                        drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+                        drive_ready(&mut raw, &storage, &apply, &mut pending, &transport).await;
                         publish_raft_metrics(&raw, &mut last_leader_id, &current_leader_id);
                     }
                     None => break,
@@ -465,7 +465,7 @@ async fn run_node<A: Apply>(
                         if let Err(e) = raw.step(msg) {
                             log::debug!("raft: step inbound failed: {:?}", e);
                         }
-                        drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+                        drive_ready(&mut raw, &storage, &apply, &mut pending, &transport).await;
                         publish_raft_metrics(&raw, &mut last_leader_id, &current_leader_id);
                     }
                     None => {
@@ -488,7 +488,7 @@ async fn drive_ready<A: Apply>(
     storage: &SharedRaftStorage,
     apply: &Arc<A>,
     pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
 ) {
     if !raw.has_ready() {
         return;
@@ -555,9 +555,7 @@ async fn drive_ready<A: Apply>(
     //     replicate concurrently with their own persist). For non-
     //     leaders these are empty; persisted messages handle that path.
     let outbound: Vec<Message> = ready.take_messages();
-    for msg in outbound {
-        transport.send(msg).await;
-    }
+    spawn_sends(transport, outbound);
 
     // 3b. Non-leader-side: vote / append-response messages MUST be
     //     sent only AFTER the hard-state and entries are durably
@@ -566,9 +564,7 @@ async fn drive_ready<A: Apply>(
     //     M4.3 — without them peers never receive MsgRequestVote so
     //     no quorum forms.
     let persisted: Vec<Message> = ready.take_persisted_messages();
-    for msg in persisted {
-        transport.send(msg).await;
-    }
+    spawn_sends(transport, persisted);
 
     // 4. Apply committed entries.
     let highest_applied = apply_committed(ready.committed_entries(), apply, pending).await;
@@ -635,6 +631,23 @@ async fn apply_committed<A: Apply>(
         }
     }
     highest
+}
+
+/// Fire-and-forget peer sends. Each message is shipped on its own
+/// tokio task so a slow / dead peer can't block the raft tick loop
+/// behind it. Per-peer send ordering is preserved by the transport
+/// (TcpTransport's per-peer mutex; LocalLoopback is synchronous).
+///
+/// Dropping the JoinHandle is fine: tokio detaches spawned tasks on
+/// handle drop, and a transport.send error is already logged inside
+/// the impl.
+fn spawn_sends(transport: &Arc<dyn Transport>, msgs: Vec<Message>) {
+    for msg in msgs {
+        let t = transport.clone();
+        tokio::spawn(async move {
+            t.send(msg).await;
+        });
+    }
 }
 
 /// Snapshot the current raft state into the operator-facing gauges

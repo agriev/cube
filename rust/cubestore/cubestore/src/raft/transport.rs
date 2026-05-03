@@ -354,7 +354,26 @@ impl PeerConn {
             PeerConnState::Disconnected => unreachable!(),
         };
 
-        let res = write_frame(stream, &payload).await;
+        // Bound the write to 2 seconds. Default TCP retransmit
+        // timeout (~30s on Linux) is way too long for raft's tick
+        // budget — a peer pod restart with a new IP would pin
+        // every send to that peer for tens of seconds before the
+        // kernel gives up. 2s covers an in-cluster k8s round-trip
+        // with an order of magnitude of headroom; anything slower
+        // is treated as a dead connection so the NEXT send
+        // reconnects on a fresh socket.
+        let res = match tokio::time::timeout(
+            Duration::from_secs(2),
+            write_frame(stream, &payload),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("write timeout to {}", self.addr),
+            )),
+        };
         if res.is_err() {
             // Drop the broken stream so the next send reconnects.
             *guard = PeerConnState::Disconnected;
