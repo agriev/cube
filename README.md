@@ -1,3 +1,24 @@
+> ## Cube Store HA fork — agriev/cube
+>
+> **This is a fork** of [cube-js/cube](https://github.com/cube-js/cube) that adds
+> high availability to the OSS Cube Store router via embedded Raft. See
+> [`HA.md`](HA.md) for the design and roadmap; [`docs/ha/`](docs/ha/) for
+> sub-milestone notes; [`docs/ha/grafana/`](docs/ha/grafana/) for the
+> operator dashboard.
+>
+> **Status as of 2026-05**: M3 (single-node Raft replication) and
+> M4 (multi-node consensus, leader election, partition-survival
+> failover) are tagged complete with full CI green; M5 (snapshot +
+> log compaction) is complete on the storage layer; M6 (leader-id
+> introspection + redirect hints) and M9 (operator metrics + Grafana)
+> are landed. The chart wiring (M7) lives in
+> [agriev/cube-stack-deployment](https://github.com/agriev/cube-stack-deployment).
+>
+> Original Cube Core README follows below — everything in this section
+> applies to the fork unmodified except where called out in `HA.md`.
+
+---
+
 ![]()
 <p align="center">
   <a href="https://cube.dev?ref=github-readme"><img src="https://raw.githubusercontent.com/cube-js/cube/master/docs/content/cube-core-logo.png" alt="Cube Core — Open-Source Semantic Layer" width="300px"></a>
