@@ -430,7 +430,7 @@ async fn drive_ready<A: Apply>(
     // storage layer; the in-process RocksMetaStore swap that lets
     // queries see the new state without a process restart is the
     // M5.6.3 follow-up.
-    if !raft::is_empty_snap(ready.snapshot()) {
+    if !ready.snapshot().is_empty() {
         let snap = ready.snapshot().clone();
         let snap_index = snap.get_metadata().index;
         match storage.apply_snapshot(snap) {
@@ -1547,4 +1547,33 @@ mod tests {
             c1, c2, c3, max - min
         );
     }
+
+    // =========================================================================
+    // M5.6.3 — Late-joining follower catches up via MsgSnapshot.
+    //
+    // DEFERRED: This test was attempted but dropped because forcing
+    // the leader's log to compact from outside the raft task corrupts
+    // raft-rs's cached invariants (it doesn't tolerate concurrent
+    // storage mutation). A proper e2e needs to drive trigger_snapshot
+    // through RaftMetaStore, which requires building RocksMetaStore
+    // instances per-replica — heavy plumbing for unit-test scope.
+    //
+    // What's covered today (sufficient for M5.6 closure on the
+    // storage layer):
+    //
+    // - storage::apply_snapshot is fully unit-tested (3 tests in
+    //   storage.rs covering metadata update, log clear, stale-
+    //   snapshot rejection, persistence across reopen).
+    // - state_machine::drive_ready calls storage.apply_snapshot when
+    //   ready.snapshot is non-empty (verified by inspection; the
+    //   path is exercised on demand in production when the leader
+    //   actually sends MsgSnapshot — there's no way to fabricate a
+    //   ready.snapshot from a test).
+    // - trigger_snapshot end-to-end through RaftMetaStore is tested
+    //   in raft_meta_store.rs.
+    //
+    // The full multi-node cluster ship test (build snapshot on
+    // leader → ship over MsgSnapshot → install on follower) belongs
+    // in the M8 chaos suite where we run full RaftMetaStore
+    // instances on real ports. Tracked there.
 }

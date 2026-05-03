@@ -161,6 +161,21 @@ impl Transport for LocalLoopback {
             let peers = self.peers.lock().unwrap();
             peers.get(&msg.to).cloned()
         };
+        // Off by default; set RAFT_LOOPBACK_TRACE=1 in test env to log
+        // every cross-peer message. Useful when debugging the snapshot
+        // ship path; quiet for the rest of the test suite.
+        if cfg!(test) && std::env::var("RAFT_LOOPBACK_TRACE").is_ok() {
+            eprintln!(
+                "loopback: {:?} from={} to={} index={} term={} commit={} delivered={}",
+                msg.msg_type,
+                msg.from,
+                msg.to,
+                msg.index,
+                msg.term,
+                msg.commit,
+                target.is_some()
+            );
+        }
         if let Some(inbound) = target {
             inbound.feed(msg);
         }
