@@ -11,12 +11,13 @@ This is a **fork** of [cube-js/cube](https://github.com/cube-js/cube) that adds
 > introspection, ship 9 operator metrics + a Grafana dashboard, and
 > include a step-by-step migration guide.
 >
-> **Remaining for production**: M7 Helm chart wiring (lives in
-> [agriev/cube-stack-deployment](https://github.com/agriev/cube-stack-deployment))
-> and M8 chaos suite at k8s scale. Both are outside this fork —
-> the entire metadata-replication core, including remote snapshot
-> backup, is fully landed and CI-green inside `agriev/cube`. Track
-> [ROADMAP](#roadmap) below.
+> **Remaining for production**: only M8 chaos suite at k8s scale.
+> The Helm chart (M7) was verified end-to-end on docker-desktop k8s:
+> `make ha-deploy && make ha-verify` brings up 3 routers, elects a
+> leader, kills it, and confirms a new leader within budget. The
+> entire metadata-replication core, including remote snapshot
+> backup and the chart wiring, is fully landed across both repos.
+> Track [ROADMAP](#roadmap) below.
 
 ## Why this fork exists
 
@@ -85,7 +86,7 @@ to whether replication is on. See [HA design plan](docs/ha/PLAN.md).
 | M4 | 3-node clustering, leader election, follower replication | ✅ **done** (`m4-complete`) |
 | M5 | Snapshot + log compaction over `RemoteFs` | ✅ **done** — storage layer (`m5-storage-complete`) + S3 upload of `snapshot.bin` (M5.x). Late-joining followers catch up peer-to-peer via raft's MsgSnapshot; remote copy covers the all-replicas-offline DR scenario. |
 | M6 | Leader-aware client routing (Cube API + workers) | ✅ **done** — raft-rs auto-forwards proposes from followers; M6.1 exposes `current_leader_id` for k8s readinessProbe; M6.2 marks no-leader errors with `raft-leader-id=N` for smart retries |
-| M7 | Helm chart updates (`agriev/cube-stack-deployment`) | todo (separate repo) |
+| M7 | Helm chart updates (`agriev/cube-stack-deployment`) | ✅ **done** (`m7-complete` in [agriev/cube-stack-deployment](https://github.com/agriev/cube-stack-deployment)) — `cubestore.ha.enabled=true` flips a 3-router Raft cluster; verified end-to-end on docker-desktop k8s with election + sub-30s failover |
 | M8 | Chaos & soak tests (kill -9, drain, partition) | todo (M4 chaos test for unit scope is in CI; k8s-scale soak still ahead) |
 | M9 | Observability (Prometheus metrics, Grafana dashboard) | ✅ **done** — 9 `cs.raft.*` metrics + ready-to-import dashboard at [`docs/ha/grafana/`](docs/ha/grafana/) |
 | M10 | Docs + migration guide from non-HA | ✅ **done** — see [`docs/ha/MIGRATION.md`](docs/ha/MIGRATION.md) |
