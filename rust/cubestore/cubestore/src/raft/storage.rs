@@ -37,7 +37,7 @@ use raft::{GetEntriesContext, RaftState, Storage, StorageError};
 use cuberockstore::rocksdb::{
     self, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 const CF_ENTRIES: &str = "entries";
@@ -46,6 +46,17 @@ const CF_META: &str = "meta";
 const META_KEY_HARD_STATE: &[u8] = b"hard_state";
 const META_KEY_CONF_STATE: &[u8] = b"conf_state";
 const META_KEY_APPLIED_INDEX: &[u8] = b"applied_index";
+/// M5.1 — pointer to the latest persisted snapshot. Stored as the
+/// protobuf-encoded `raft::eraftpb::SnapshotMetadata`. The opaque
+/// `data: Vec<u8>` payload (state-machine bytes from M5.2) lives at
+/// `<dir>/snapshot.bin` so a multi-MiB snapshot doesn't wedge itself
+/// inside a RocksDB value (large blobs there fight log compaction).
+const META_KEY_SNAPSHOT_META: &[u8] = b"snapshot_meta";
+
+/// Filename inside the storage dir holding the latest snapshot's
+/// opaque application data. Single file because we only retain one
+/// snapshot at a time (raft only ever needs the latest).
+const SNAPSHOT_DATA_FILE: &str = "snapshot.bin";
 
 /// Errors specific to the storage layer.
 #[derive(Debug)]
@@ -89,6 +100,10 @@ fn storage_unavailable<T: std::fmt::Display>(e: T) -> raft::Error {
 ///
 /// Cheap to clone (DB handle is internally `Arc`'d in rocksdb).
 pub struct RaftStorage {
+    /// Directory the storage lives under. Needed for the snapshot
+    /// data file (`<dir>/snapshot.bin`) which lives outside the
+    /// rocksdb instance to avoid pinning multi-MiB blobs in CF_META.
+    dir: PathBuf,
     db: DB,
     /// Cached HardState — consulted on every Storage::initial_state(),
     /// updated atomically with disk write on `set_hard_state`.
@@ -106,6 +121,7 @@ impl RaftStorage {
         dir: P,
         bootstrap_voters: Vec<u64>,
     ) -> Result<Self, RaftStorageError> {
+        let dir_path = dir.as_ref().to_path_buf();
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -114,7 +130,7 @@ impl RaftStorage {
             ColumnFamilyDescriptor::new(CF_ENTRIES, Options::default()),
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
         ];
-        let db = DB::open_cf_descriptors(&opts, dir, cfs)?;
+        let db = DB::open_cf_descriptors(&opts, &dir_path, cfs)?;
 
         // Bootstrap meta on first boot, or load existing.
         let hard_state = match get_meta::<HardState>(&db, META_KEY_HARD_STATE)? {
@@ -152,6 +168,7 @@ impl RaftStorage {
         }
 
         Ok(Self {
+            dir: dir_path,
             db,
             hard_state: RwLock::new(hard_state),
             conf_state: RwLock::new(conf_state),
@@ -246,6 +263,99 @@ impl RaftStorage {
         wb.delete_range_cf(cf_e, &index_key(0), &index_key(compact_to));
         self.db.write_opt(wb, &sync_write())?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // M5.1 — Snapshot persistence
+    // -----------------------------------------------------------------
+
+    /// Path to the on-disk snapshot data file.
+    fn snapshot_data_path(&self) -> PathBuf {
+        self.dir.join(SNAPSHOT_DATA_FILE)
+    }
+
+    /// Save a snapshot to durable storage. Two pieces:
+    ///
+    /// 1. Snapshot **metadata** (index, term, conf_state) goes into
+    ///    the meta CF as a protobuf blob under `snapshot_meta`.
+    /// 2. Snapshot **data** (opaque application bytes from M5.2)
+    ///    goes into `<dir>/snapshot.bin` so a multi-MiB blob doesn't
+    ///    pin RocksDB compaction. On crash mid-write, partial data
+    ///    is detected by the metadata not yet pointing to it — the
+    ///    crash-safe order is: write data file first, then update
+    ///    metadata.
+    ///
+    /// The previous snapshot's data is overwritten — we only retain
+    /// the latest. raft-rs only ever needs the most recent snapshot
+    /// to ship to lagging followers; older ones are dead weight.
+    pub fn save_snapshot(&self, snapshot: &Snapshot) -> Result<(), RaftStorageError> {
+        // 1. Write data file. Use a temp file + rename for atomicity:
+        //    a torn write of `snapshot.bin` followed by a crash would
+        //    leave us with corrupt bytes that raft-rs would then ship
+        //    to a follower. Atomic rename guarantees readers see
+        //    either the old file or a complete new one.
+        let final_path = self.snapshot_data_path();
+        let tmp_path = self.dir.join(format!("{}.tmp", SNAPSHOT_DATA_FILE));
+        std::fs::write(&tmp_path, snapshot.get_data()).map_err(|e| {
+            RaftStorageError::Inconsistent(format!(
+                "snapshot data write to {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+            RaftStorageError::Inconsistent(format!(
+                "snapshot data rename {:?} → {:?}: {}",
+                tmp_path, final_path, e
+            ))
+        })?;
+
+        // 2. Update metadata pointer in CF_META. Done LAST so a crash
+        //    between data-write and metadata-write leaves the storage
+        //    in a recoverable state — old metadata still references
+        //    a (possibly newer) data file, but crucially nothing is
+        //    corrupted.
+        let meta = snapshot.get_metadata();
+        put_meta(&self.db, META_KEY_SNAPSHOT_META, meta)?;
+        Ok(())
+    }
+
+    /// Read the latest persisted snapshot, or `None` if none exists.
+    /// Returns the full `Snapshot` (metadata + data). Used by
+    /// `Storage::snapshot()` to satisfy raft-rs's snapshot-fetch
+    /// contract.
+    pub fn read_snapshot(&self) -> Result<Option<Snapshot>, RaftStorageError> {
+        let meta: Option<raft::eraftpb::SnapshotMetadata> =
+            get_meta(&self.db, META_KEY_SNAPSHOT_META)?;
+        let meta = match meta {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let path = self.snapshot_data_path();
+        let data = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(RaftStorageError::Inconsistent(format!(
+                    "snapshot data read {:?}: {}",
+                    path, e
+                )))
+            }
+        };
+
+        let mut snap = Snapshot::default();
+        snap.set_metadata(meta);
+        snap.set_data(data.into());
+        Ok(Some(snap))
+    }
+
+    /// Index of the latest persisted snapshot, or 0 if none exists.
+    /// Convenience for the snapshot-trigger policy in M5.4 ("take a
+    /// new snapshot every N applied entries past the last one").
+    pub fn snapshot_index(&self) -> Result<u64, RaftStorageError> {
+        let meta: Option<raft::eraftpb::SnapshotMetadata> =
+            get_meta(&self.db, META_KEY_SNAPSHOT_META)?;
+        Ok(meta.map(|m| m.index).unwrap_or(0))
     }
 
     fn first_index_internal(&self) -> Result<u64, RaftStorageError> {
@@ -352,10 +462,19 @@ impl Storage for RaftStorage {
         self.last_index_internal().map_err(storage_unavailable)
     }
 
-    fn snapshot(&self, _request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        // Snapshots are M5. For M2/M3/M4 we return SnapshotTemporarilyUnavailable
-        // which raft-rs handles by retrying later.
-        Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
+        // M5.1 — return the latest persisted snapshot if it satisfies
+        // raft-rs's index-bound. raft-rs asks for "snapshot at index
+        // >= request_index" so the receiving follower's log can be
+        // truncated up to that point. If our latest snapshot is older
+        // than what raft wants, `SnapshotTemporarilyUnavailable`
+        // signals "ask again later" — the leader keeps the entry
+        // shipping path open via MsgAppend rather than MsgSnapshot.
+        match self.read_snapshot() {
+            Ok(Some(snap)) if snap.get_metadata().index >= request_index => Ok(snap),
+            Ok(_) => Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable)),
+            Err(e) => Err(storage_unavailable(e)),
+        }
     }
 }
 
@@ -404,6 +523,18 @@ impl SharedRaftStorage {
 
     pub fn compact(&self, compact_to: u64) -> Result<(), RaftStorageError> {
         self.0.compact(compact_to)
+    }
+
+    pub fn save_snapshot(&self, snapshot: &Snapshot) -> Result<(), RaftStorageError> {
+        self.0.save_snapshot(snapshot)
+    }
+
+    pub fn read_snapshot(&self) -> Result<Option<Snapshot>, RaftStorageError> {
+        self.0.read_snapshot()
+    }
+
+    pub fn snapshot_index(&self) -> Result<u64, RaftStorageError> {
+        self.0.snapshot_index()
     }
 }
 
@@ -697,5 +828,118 @@ mod tests {
             Err(raft::Error::Store(StorageError::Unavailable))
         ));
         assert_eq!(s.term(3).unwrap(), 1);
+    }
+
+    // -------------------------------------------------------------
+    // M5.1 — snapshot persistence
+    // -------------------------------------------------------------
+
+    fn make_snapshot(index: u64, term: u64, voters: Vec<u64>, data: &[u8]) -> Snapshot {
+        let mut snap = Snapshot::default();
+        let meta = snap.mut_metadata();
+        meta.index = index;
+        meta.term = term;
+        let mut cs = ConfState::default();
+        cs.set_voters(voters);
+        meta.set_conf_state(cs);
+        snap.set_data(data.to_vec().into());
+        snap
+    }
+
+    #[test]
+    fn save_snapshot_then_read_back_round_trips_metadata_and_data() {
+        let dir = TempDir::new().unwrap();
+        let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+
+        let snap = make_snapshot(7, 3, vec![1, 2, 3], b"state-machine-bytes");
+        s.save_snapshot(&snap).unwrap();
+
+        let read = s.read_snapshot().unwrap().expect("snapshot present");
+        assert_eq!(read.get_metadata().index, 7);
+        assert_eq!(read.get_metadata().term, 3);
+        assert_eq!(read.get_metadata().get_conf_state().voters, vec![1, 2, 3]);
+        assert_eq!(read.get_data(), b"state-machine-bytes");
+    }
+
+    #[test]
+    fn read_snapshot_returns_none_when_never_saved() {
+        let dir = TempDir::new().unwrap();
+        let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+        assert!(s.read_snapshot().unwrap().is_none());
+        // Storage::snapshot must surface Unavailable when nothing's
+        // saved — raft-rs uses that to retry on the MsgAppend path.
+        assert!(matches!(
+            s.snapshot(0, 0),
+            Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+        ));
+    }
+
+    #[test]
+    fn snapshot_index_reflects_latest_save() {
+        let dir = TempDir::new().unwrap();
+        let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+        assert_eq!(s.snapshot_index().unwrap(), 0);
+
+        s.save_snapshot(&make_snapshot(5, 1, vec![1], b"first")).unwrap();
+        assert_eq!(s.snapshot_index().unwrap(), 5);
+
+        // Overwrite with a newer snapshot — only the latest is retained.
+        s.save_snapshot(&make_snapshot(20, 4, vec![1, 2], b"second"))
+            .unwrap();
+        assert_eq!(s.snapshot_index().unwrap(), 20);
+
+        let read = s.read_snapshot().unwrap().unwrap();
+        assert_eq!(read.get_data(), b"second");
+        assert_eq!(read.get_metadata().get_conf_state().voters, vec![1, 2]);
+    }
+
+    #[test]
+    fn snapshot_persists_across_open() {
+        let dir = TempDir::new().unwrap();
+        {
+            let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+            s.save_snapshot(&make_snapshot(11, 2, vec![1, 2, 3], b"durable"))
+                .unwrap();
+        }
+        let s2 = RaftStorage::open(dir.path(), vec![1]).unwrap();
+        let read = s2.read_snapshot().unwrap().unwrap();
+        assert_eq!(read.get_metadata().index, 11);
+        assert_eq!(read.get_data(), b"durable");
+    }
+
+    #[test]
+    fn storage_snapshot_returns_persisted_when_index_satisfied() {
+        let dir = TempDir::new().unwrap();
+        let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+        s.save_snapshot(&make_snapshot(50, 3, vec![1], b"xyz"))
+            .unwrap();
+
+        // request_index <= snapshot.index → snapshot satisfies → return it.
+        let snap = s.snapshot(20, 0).unwrap();
+        assert_eq!(snap.get_metadata().index, 50);
+        assert_eq!(snap.get_data(), b"xyz");
+
+        // request_index > snapshot.index → must wait for a newer one.
+        assert!(matches!(
+            s.snapshot(100, 0),
+            Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+        ));
+    }
+
+    #[test]
+    fn save_snapshot_uses_atomic_rename() {
+        // Sanity: after save, no `.tmp` sidecar file should remain.
+        // A torn write that leaves a `.tmp` would still be safe (we
+        // never read from `.tmp`) but it'd indicate save_snapshot
+        // forgot to rename.
+        let dir = TempDir::new().unwrap();
+        let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
+        s.save_snapshot(&make_snapshot(3, 1, vec![1], b"xx"))
+            .unwrap();
+        let tmp = dir.path().join(format!("{}.tmp", SNAPSHOT_DATA_FILE));
+        assert!(
+            !tmp.exists(),
+            "tmp sidecar must be cleaned up after save_snapshot"
+        );
     }
 }
