@@ -44,6 +44,7 @@
 pub mod command;
 pub mod raft_meta_store;
 pub mod rocks_apply;
+pub mod snapshot_payload;
 pub mod state_machine;
 pub mod storage;
 pub mod transport;
