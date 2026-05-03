@@ -25,13 +25,15 @@
 //! Milestone status:
 //! - [x] M1 — `MetaCommand` enum with representative variants
 //! - [x] M2 — single-node Raft state machine + persistent storage
-//! - [x] M3.1 — Cat A/B variants (~28 of 86 write methods)
-//! - [x] M3.2 — `MetaCommandResult` typed returns
-//! - [ ] M3.3 — `RocksMetaStoreApply` dispatch (in progress)
-//! - [ ] M3.4 — Determinism fix: leader-assigned IDs / timestamps
-//! - [ ] M3.5 — Config wiring: `CUBESTORE_HA_MODE` boot path
-//! - [ ] M3.6 — `cubestore-sql-tests` passing under HA mode
-//! - [ ] M4 — Multi-node clustering + leader election
+//! - [x] M3 — full `RaftMetaStore: MetaStore` impl + DI binding
+//!         + determinism fix + sql-tests passing under HA mode
+//! - [x] M4.1 — `Transport` trait + `LocalLoopback` test transport
+//! - [x] M4.2 — `RaftNode::start_multi_node` — outbound + inbound
+//!         message paths, persisted-messages quirk fixed
+//! - [x] M4.3 — 3-node cluster test: election + replication + apply
+//! - [x] M4.4 — Leader failover test via partition injection
+//! - [ ] M4.5 — cuberpc-backed transport + `CUBESTORE_RAFT_PEERS`
+//! - [ ] M5 — Snapshot + log compaction
 
 pub mod command;
 pub mod raft_meta_store;
@@ -42,3 +44,4 @@ pub mod transport;
 
 pub use command::{MetaCommand, MetaCommandCodecError};
 pub use raft_meta_store::RaftMetaStore;
+pub use transport::{Inbound, LocalLoopback, Transport};

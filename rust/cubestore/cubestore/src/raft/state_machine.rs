@@ -30,6 +30,7 @@
 
 use crate::raft::command::{MetaCommand, MetaCommandCodecError, MetaCommandResult};
 use crate::raft::storage::{RaftStorage, RaftStorageError, SharedRaftStorage};
+use crate::raft::transport::{Inbound, Transport};
 use crate::CubeError;
 use async_trait::async_trait;
 use raft::eraftpb::{ConfState, Entry, EntryType, Message};
@@ -119,6 +120,16 @@ pub struct RaftNode {
     proposals: mpsc::UnboundedSender<Proposal>,
 }
 
+/// What kind of cluster this node is part of. Drives bootstrap-time
+/// behavior — single-node forces an immediate election to skip the
+/// 500ms timer countdown; multi-node lets the timer-driven election
+/// run normally so peer-to-peer voting works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClusterKind {
+    Single,
+    Multi,
+}
+
 impl RaftNode {
     /// Boot a single-node Raft group with persistent RocksDB storage.
     ///
@@ -145,6 +156,67 @@ impl RaftNode {
         storage: SharedRaftStorage,
         apply: Arc<A>,
     ) -> Result<Self, RaftError> {
+        // Single-node has no transport; install a no-op transport
+        // and an inbound the test never feeds.
+        let transport = Arc::new(NoopTransport);
+        let (_inbound, inbound_rx) = Inbound::new();
+        Self::start_inner(node_id, storage, apply, transport, inbound_rx, ClusterKind::Single)
+    }
+
+    /// Boot a multi-node Raft replica. The caller supplies:
+    ///
+    /// - `data_dir`: where the Raft log + HardState + ConfState live.
+    /// - `node_id`: this replica's id (must be unique in the cluster).
+    /// - `voters`: the full peer-id set for the initial cluster
+    ///   (e.g. `[1, 2, 3]`). Used only on first boot to seed the
+    ///   ConfState; ignored on restart (we resume from disk).
+    /// - `transport`: how outbound `raft::Message`s reach peers.
+    /// - `inbound_rx`: where inbound messages arrive from. Construct
+    ///   via [`Inbound::new`] before calling and hand the matching
+    ///   [`Inbound`] to your transport so it can deliver received
+    ///   messages back to this node.
+    /// - `apply`: the `Apply` impl that runs against committed
+    ///   commands (production: `RocksMetaStoreApply`).
+    ///
+    /// Multi-node bootstrap does NOT call `campaign()` — peer-driven
+    /// timer elections run normally so the cluster picks a single
+    /// leader by majority vote rather than every node racing to
+    /// elect itself.
+    pub fn start_multi_node<A: Apply, T: Transport>(
+        data_dir: impl AsRef<Path>,
+        node_id: u64,
+        voters: Vec<u64>,
+        apply: Arc<A>,
+        transport: Arc<T>,
+        inbound_rx: mpsc::UnboundedReceiver<Message>,
+    ) -> Result<Self, RaftError> {
+        let storage_inner = RaftStorage::open(data_dir, voters)?;
+        let storage = SharedRaftStorage::new(Arc::new(storage_inner));
+        Self::start_inner(node_id, storage, apply, transport, inbound_rx, ClusterKind::Multi)
+    }
+
+    /// Test-only entry point: open storage with an explicit voter
+    /// list and a caller-provided transport. Used by the multi-node
+    /// loopback tests.
+    #[doc(hidden)]
+    pub fn start_with_storage_multi<A: Apply, T: Transport>(
+        node_id: u64,
+        storage: SharedRaftStorage,
+        apply: Arc<A>,
+        transport: Arc<T>,
+        inbound_rx: mpsc::UnboundedReceiver<Message>,
+    ) -> Result<Self, RaftError> {
+        Self::start_inner(node_id, storage, apply, transport, inbound_rx, ClusterKind::Multi)
+    }
+
+    fn start_inner<A: Apply, T: Transport>(
+        node_id: u64,
+        storage: SharedRaftStorage,
+        apply: Arc<A>,
+        transport: Arc<T>,
+        inbound_rx: mpsc::UnboundedReceiver<Message>,
+        kind: ClusterKind,
+    ) -> Result<Self, RaftError> {
         let logger = build_drain_logger();
 
         let cfg = Config {
@@ -164,7 +236,14 @@ impl RaftNode {
         let (tx, rx) = mpsc::unbounded_channel::<Proposal>();
         let pending = std::collections::HashMap::<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>::new();
 
-        tokio::spawn(run_node(raw, storage, rx, apply, pending, logger));
+        // Use Arc<dyn Transport> so the run_node task doesn't carry a
+        // generic parameter (tokio::spawn captures must be 'static and
+        // monomorphized per-T explosions get noisy).
+        let transport_dyn: Arc<dyn Transport> = transport;
+
+        tokio::spawn(run_node(
+            raw, storage, rx, apply, pending, logger, transport_dyn, inbound_rx, kind,
+        ));
 
         Ok(Self { proposals: tx })
     }
@@ -183,6 +262,20 @@ impl RaftNode {
     }
 }
 
+/// Single-node mode has no peers; install a `Transport` that drops
+/// every message. Outbound messages still arise (heartbeats addressed
+/// to self filter out at the raft-rs layer; the rare stray gets
+/// discarded here).
+struct NoopTransport;
+
+#[async_trait]
+impl Transport for NoopTransport {
+    async fn send(&self, _msg: Message) {
+        // intentionally empty
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_node<A: Apply>(
     mut raw: RawNode<SharedRaftStorage>,
     storage: SharedRaftStorage,
@@ -190,6 +283,9 @@ async fn run_node<A: Apply>(
     apply: Arc<A>,
     mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
     logger: slog::Logger,
+    transport: Arc<dyn Transport>,
+    mut inbound: mpsc::UnboundedReceiver<Message>,
+    kind: ClusterKind,
 ) {
     let _ = logger; // reserved for future structured-log calls
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -199,21 +295,24 @@ async fn run_node<A: Apply>(
     // don't race against the default `election_tick` countdown. Without
     // this, the first ~500ms of node life is "follower waiting for leader"
     // and any proposal in that window returns ProposalDropped. Multi-node
-    // mode (M4) keeps timer-driven elections — explicit campaign on every
-    // node would interfere with peer-driven elections.
-    if let Err(e) = raw.campaign() {
-        log::warn!(
-            "raft: initial campaign() failed (will fall back to timer): {:?}",
-            e
-        );
+    // mode keeps timer-driven elections — explicit campaign on every
+    // node would interfere with peer-driven elections (multiple
+    // candidates in the same term split the vote and force re-election).
+    if kind == ClusterKind::Single {
+        if let Err(e) = raw.campaign() {
+            log::warn!(
+                "raft: initial campaign() failed (will fall back to timer): {:?}",
+                e
+            );
+        }
     }
-    drive_ready(&mut raw, &storage, &apply, &mut pending).await;
+    drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 raw.tick();
-                drive_ready(&mut raw, &storage, &apply, &mut pending).await;
+                drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
             }
             maybe = proposals.recv() => {
                 match maybe {
@@ -227,6 +326,11 @@ async fn run_node<A: Apply>(
                                 continue;
                             }
                         };
+                        // Followers can't accept proposals — raft-rs
+                        // returns `ProposalDropped`. Surface that as
+                        // a routable error so the wrapping
+                        // `RaftMetaStore` can decide to forward to the
+                        // leader (M4.5) or fail back to the caller.
                         let next_index = raw.raft.raft_log.last_index() + 1;
                         if let Err(e) = raw.propose(vec![], bytes) {
                             let _ = p.respond_to.send(Err(CubeError::internal(format!(
@@ -235,9 +339,32 @@ async fn run_node<A: Apply>(
                             continue;
                         }
                         pending.insert(next_index, p.respond_to);
-                        drive_ready(&mut raw, &storage, &apply, &mut pending).await;
+                        drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
                     }
                     None => break,
+                }
+            }
+            maybe = inbound.recv() => {
+                match maybe {
+                    Some(msg) => {
+                        // Step the message into the raft state machine.
+                        // Errors here are expected during normal operation
+                        // (stale messages from a previous term, votes
+                        // for higher terms, etc.) — log at debug only.
+                        if let Err(e) = raw.step(msg) {
+                            log::debug!("raft: step inbound failed: {:?}", e);
+                        }
+                        drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+                    }
+                    None => {
+                        // Inbound channel closed — transport is gone.
+                        // Single-node mode never feeds it so this is
+                        // also the normal idle path. Don't break the
+                        // loop; just stop polling this branch.
+                        // tokio::select drops a closed branch
+                        // automatically by returning Pending forever
+                        // on the next iteration.
+                    }
                 }
             }
         }
@@ -249,6 +376,7 @@ async fn drive_ready<A: Apply>(
     storage: &SharedRaftStorage,
     apply: &Arc<A>,
     pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
+    transport: &dyn Transport,
 ) {
     if !raw.has_ready() {
         return;
@@ -275,9 +403,25 @@ async fn drive_ready<A: Apply>(
         }
     }
 
-    // 3. Send outbound messages. Single-node has no peers — no-op.
-    //    M4 will route these through the cuberpc transport.
-    let _outbound: Vec<Message> = ready.take_messages();
+    // 3a. Leader-side: messages can be sent BEFORE the hard-state /
+    //     entry persists complete (raft thesis 10.2.1 — leaders can
+    //     replicate concurrently with their own persist). For non-
+    //     leaders these are empty; persisted messages handle that path.
+    let outbound: Vec<Message> = ready.take_messages();
+    for msg in outbound {
+        transport.send(msg).await;
+    }
+
+    // 3b. Non-leader-side: vote / append-response messages MUST be
+    //     sent only AFTER the hard-state and entries are durably
+    //     persisted (we already did that above in steps 1 + 2).
+    //     Skipping these is the bug that kept candidates spinning in
+    //     M4.3 — without them peers never receive MsgRequestVote so
+    //     no quorum forms.
+    let persisted: Vec<Message> = ready.take_persisted_messages();
+    for msg in persisted {
+        transport.send(msg).await;
+    }
 
     // 4. Apply committed entries.
     let highest_applied = apply_committed(ready.committed_entries(), apply, pending).await;
@@ -285,15 +429,22 @@ async fn drive_ready<A: Apply>(
         let _ = storage.set_applied_index(idx); // best-effort; M5 uses for snapshots
     }
 
-    // 5. Tell raft we're done with this Ready.
+    // 5. Tell raft we're done with this Ready. light_ready carries
+    //    leader-side commit-broadcast etc. — the persisted-messages
+    //    path already drained the candidate/follower side so we only
+    //    need take_messages here.
     let mut light_ready = raw.advance(ready);
+
+    let light_msgs: Vec<Message> = light_ready.take_messages();
+    for msg in light_msgs {
+        transport.send(msg).await;
+    }
 
     let highest_applied2 = apply_committed(light_ready.committed_entries(), apply, pending).await;
     if let Some(idx) = highest_applied2 {
         let _ = storage.set_applied_index(idx);
     }
     raw.advance_apply();
-    let _ = light_ready.take_messages();
 }
 
 /// Apply each committed entry, return the highest index actually
@@ -846,5 +997,232 @@ mod tests {
         let _ = fs::remove_dir_all(&rp_a);
         let _ = fs::remove_dir_all(&sp_b);
         let _ = fs::remove_dir_all(&rp_b);
+    }
+
+    // =========================================================================
+    // M4 — multi-node clustering tests
+    // =========================================================================
+
+    use crate::raft::transport::{Inbound, LocalLoopback};
+
+    /// Find the leader by trying to propose a tiny no-op on each node.
+    /// Followers reply with an error ("raft propose failed: ProposalDropped");
+    /// the leader resolves Ok. Returns the (id, &node) of whoever wins.
+    /// Polls for up to `deadline` because elections take a few ticks.
+    async fn await_leader<'a>(
+        nodes: &'a [(u64, RaftNode)],
+        deadline: Duration,
+    ) -> &'a (u64, RaftNode) {
+        let probe = MetaCommand::CreateSchema {
+            schema_name: "__leader_probe__".into(),
+            if_not_exists: true,
+        };
+        let start = std::time::Instant::now();
+        loop {
+            for n in nodes {
+                let res = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    n.1.propose(probe.clone()),
+                )
+                .await;
+                if let Ok(Ok(_)) = res {
+                    return n;
+                }
+            }
+            if start.elapsed() > deadline {
+                panic!("no leader elected within {:?}", deadline);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Three local nodes connected by a `LocalLoopback` transport
+    /// elect a leader, replicate a write through the log, and apply
+    /// it on every replica. This is the M4 baseline guarantee:
+    /// committed entries reach every voter's apply path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_node_cluster_replicates_writes_to_all_followers() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let dir3 = TempDir::new().unwrap();
+
+        let transport = Arc::new(LocalLoopback::new());
+        let (in1, rx1) = Inbound::new();
+        let (in2, rx2) = Inbound::new();
+        let (in3, rx3) = Inbound::new();
+        transport.register(1, in1);
+        transport.register(2, in2);
+        transport.register(3, in3);
+
+        let apply1 = Arc::new(RecordingApply::new());
+        let apply2 = Arc::new(RecordingApply::new());
+        let apply3 = Arc::new(RecordingApply::new());
+
+        let n1 = RaftNode::start_multi_node(
+            dir1.path(),
+            1,
+            vec![1, 2, 3],
+            Arc::clone(&apply1),
+            Arc::clone(&transport),
+            rx1,
+        )
+        .expect("start n1");
+        let n2 = RaftNode::start_multi_node(
+            dir2.path(),
+            2,
+            vec![1, 2, 3],
+            Arc::clone(&apply2),
+            Arc::clone(&transport),
+            rx2,
+        )
+        .expect("start n2");
+        let n3 = RaftNode::start_multi_node(
+            dir3.path(),
+            3,
+            vec![1, 2, 3],
+            Arc::clone(&apply3),
+            Arc::clone(&transport),
+            rx3,
+        )
+        .expect("start n3");
+
+        let nodes = vec![(1u64, n1), (2u64, n2), (3u64, n3)];
+        let leader = await_leader(&nodes, Duration::from_secs(15)).await;
+        let leader_id = leader.0;
+
+        // Drive a real write through the leader. Every replica's
+        // Apply must observe it.
+        let cmd = MetaCommand::CreateSchema {
+            schema_name: "after_leader".into(),
+            if_not_exists: true,
+        };
+        tokio::time::timeout(Duration::from_secs(10), leader.1.propose(cmd.clone()))
+            .await
+            .expect("propose timed out")
+            .expect("propose failed at the leader");
+
+        // Allow followers' apply paths to drain. raft-rs commits on
+        // majority ack (already done before the propose oneshot
+        // resolves), then advances the followers' commit-index on the
+        // next heartbeat — give one tick interval plus headroom.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let probe = MetaCommand::CreateSchema {
+            schema_name: "__leader_probe__".into(),
+            if_not_exists: true,
+        };
+        for (id, _) in &nodes {
+            // Each replica should have applied:
+            //   1) the empty entry from leader-election (skipped)
+            //   2) one or more probe commands (`__leader_probe__`)
+            //      sent by `await_leader`
+            //   3) exactly one `after_leader` command from the real
+            //      propose
+            let recorded = match *id {
+                1 => apply1.snapshot(),
+                2 => apply2.snapshot(),
+                3 => apply3.snapshot(),
+                _ => unreachable!(),
+            };
+            let after = recorded
+                .iter()
+                .filter(|c| **c == cmd)
+                .count();
+            let probes = recorded
+                .iter()
+                .filter(|c| **c == probe)
+                .count();
+            assert_eq!(
+                after, 1,
+                "replica {} must apply the post-election write exactly once (saw {})",
+                id, after
+            );
+            assert!(
+                probes >= 1,
+                "replica {} must apply at least one leader-probe command (saw {})",
+                id, probes
+            );
+        }
+
+        // The leader id should be one of {1, 2, 3} — we don't assert
+        // which (election is non-deterministic) but log it so the test
+        // output names whoever won.
+        assert!(
+            (1..=3).contains(&leader_id),
+            "leader id {} out of range",
+            leader_id
+        );
+    }
+
+    /// Killing the leader (we simulate it by partitioning it from the
+    /// rest of the cluster, which is the failure mode k8s pod-delete
+    /// looks like to the surviving peers) must produce a new leader
+    /// within a few seconds. This is the failover SLA from
+    /// `docs/ha/PLAN.md` verification step 1.
+    ///
+    /// We can't actually drop the tokio task — the LocalLoopback's
+    /// `unregister` is the right model: messages from/to the killed
+    /// node disappear, identical to a network partition. The killed
+    /// node keeps spinning but its outbound goes nowhere; quorum
+    /// shifts to the remaining two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_failover_within_seconds_after_partition() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let dir3 = TempDir::new().unwrap();
+
+        let transport = Arc::new(LocalLoopback::new());
+        let (in1, rx1) = Inbound::new();
+        let (in2, rx2) = Inbound::new();
+        let (in3, rx3) = Inbound::new();
+        transport.register(1, in1);
+        transport.register(2, in2);
+        transport.register(3, in3);
+
+        let apply1 = Arc::new(RecordingApply::new());
+        let apply2 = Arc::new(RecordingApply::new());
+        let apply3 = Arc::new(RecordingApply::new());
+
+        let n1 = RaftNode::start_multi_node(
+            dir1.path(), 1, vec![1, 2, 3],
+            Arc::clone(&apply1), Arc::clone(&transport), rx1,
+        ).expect("start n1");
+        let n2 = RaftNode::start_multi_node(
+            dir2.path(), 2, vec![1, 2, 3],
+            Arc::clone(&apply2), Arc::clone(&transport), rx2,
+        ).expect("start n2");
+        let n3 = RaftNode::start_multi_node(
+            dir3.path(), 3, vec![1, 2, 3],
+            Arc::clone(&apply3), Arc::clone(&transport), rx3,
+        ).expect("start n3");
+
+        let nodes = vec![(1u64, n1), (2u64, n2), (3u64, n3)];
+        let first_leader = await_leader(&nodes, Duration::from_secs(15)).await;
+        let killed_id = first_leader.0;
+
+        // Partition the leader off the loopback: outbound messages
+        // from the leader still happen, but they go to peers — fine,
+        // they still receive but have no quorum. Inbound to the
+        // leader is what we drop. Without inbound MsgAppendResponse
+        // the leader can't commit anything; the surviving two
+        // (deprived of heartbeats) will time out and elect a new one.
+        transport.unregister(killed_id);
+
+        // Find the new leader among the survivors. With election_tick
+        // = 10 and heartbeat = 3 ticks (50ms each), elections converge
+        // in roughly 1-2 rounds = ~750ms-1.5s. Give 10s for safety.
+        let survivors: Vec<&(u64, RaftNode)> = nodes
+            .iter()
+            .filter(|(id, _)| *id != killed_id)
+            .collect();
+        let owned: Vec<(u64, RaftNode)> = survivors
+            .iter()
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
+        let new_leader = await_leader(&owned, Duration::from_secs(10)).await;
+        assert_ne!(
+            new_leader.0, killed_id,
+            "new leader must be a surviving node, not the killed one"
+        );
     }
 }
