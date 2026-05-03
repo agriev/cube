@@ -1461,6 +1461,15 @@ pub struct RocksMetaStore {
 }
 
 impl RocksMetaStore {
+    /// HA fork — M5.3 accessor: hand the live RocksDB Arc to the
+    /// raft snapshot builder so it can call `Checkpoint::new` against
+    /// it. Cloning the Arc is cheap and doesn't disturb writers; the
+    /// checkpoint API itself hardlinks SST files (no copies, no write
+    /// stall).
+    pub fn rocksdb_arc(&self) -> std::sync::Arc<cuberockstore::rocksdb::DB> {
+        self.store.db.clone()
+    }
+
     pub fn new(
         path: &Path,
         metastore_fs: Arc<dyn MetaStoreFs>,
