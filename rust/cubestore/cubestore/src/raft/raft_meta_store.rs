@@ -142,7 +142,7 @@ impl RaftMetaStore {
         &self.store
     }
 
-    /// M5.4 — explicit snapshot trigger.
+    /// M5.4 + M5.5 — explicit snapshot trigger with log compaction.
     ///
     /// 1. Reads the current `applied_index` from the raft storage.
     /// 2. Reads the current ConfState (and looks up the term for
@@ -150,23 +150,30 @@ impl RaftMetaStore {
     /// 3. Calls `build_state_machine_snapshot_bytes` against the
     ///    live `RocksMetaStore` to produce the data payload.
     /// 4. Persists the full Snapshot via `storage.save_snapshot`.
+    /// 5. Compacts the log up to `snapshot.index - keep_past` so
+    ///    late-arriving followers within `keep_past` entries can
+    ///    still catch up via MsgAppend instead of MsgSnapshot.
     ///
     /// `staging_root` is where the temporary RocksDB checkpoint dir
     /// lives during the build (typically the same dir as the raft
     /// log, so it stays on the same FS).
     ///
-    /// Does NOT compact the log — that's M5.5 and runs as a follow-
-    /// up step the caller invokes once the snapshot is durable. The
-    /// split lets the caller decide a compaction strategy (e.g.
-    /// keep N entries past the snapshot for late stragglers).
+    /// `keep_past` — number of entries to retain past the snapshot
+    /// before compaction. 0 = compact everything up to snapshot.index;
+    /// 100 = retain the last 100 entries even though they're covered
+    /// by the snapshot. The default in operator-facing trigger paths
+    /// (M5.4 follow-up janitor) will be ~1000 to absorb typical
+    /// follower lag without forcing snapshot ship.
     ///
-    /// Idempotent against concurrent callers via the mpsc serialization
-    /// in raft_storage's underlying RwLock semantics — but the caller
-    /// is expected to invoke this from a single janitor task (M5.4
-    /// follow-up will add the timer-driven version).
+    /// Caller is expected to invoke this from a single janitor task —
+    /// concurrent invocations would race on save_snapshot's
+    /// metadata pointer (the data file rename is atomic but two
+    /// concurrent rebuilds doing different checkpoints is wasted
+    /// work). The future timer-driven janitor will own that.
     pub async fn trigger_snapshot(
         &self,
         staging_root: &std::path::Path,
+        keep_past: u64,
     ) -> Result<(), CubeError> {
         use crate::raft::snapshot_builder;
         use raft::Storage;
@@ -210,6 +217,26 @@ impl RaftMetaStore {
         storage
             .save_snapshot(&snapshot)
             .map_err(|e| CubeError::internal(format!("save_snapshot: {}", e)))?;
+
+        // M5.5 — log compaction.
+        //
+        // Drop entries up to `applied - keep_past`, but never below
+        // 1 (raft-rs requires first_index() >= 1) and never past
+        // `applied` itself (we still need the entry that backs
+        // applied_index for `term(applied)` lookups in future
+        // snapshots).
+        //
+        // The log layer's `compact(N)` removes entries with index < N.
+        // So passing `applied - keep_past` retains everything from
+        // (applied - keep_past) onward.
+        if applied > keep_past {
+            let compact_to = applied.saturating_sub(keep_past);
+            if compact_to > 1 {
+                storage
+                    .compact(compact_to)
+                    .map_err(|e| CubeError::internal(format!("compact: {}", e)))?;
+            }
+        }
         Ok(())
     }
 
@@ -1488,10 +1515,12 @@ mod tests {
         }
 
         // Build + persist the snapshot. Staging dir lives next to
-        // the raft log so we don't cross filesystems.
+        // the raft log so we don't cross filesystems. `keep_past=u64::MAX`
+        // disables compaction so this test doesn't depend on it —
+        // compaction has its own dedicated test below.
         let staging = raft_dir.path().join("snapshot-staging");
         wrapper
-            .trigger_snapshot(&staging)
+            .trigger_snapshot(&staging, u64::MAX)
             .await
             .expect("trigger_snapshot");
 
@@ -1527,6 +1556,69 @@ mod tests {
         // current snapshot.index.
         let s = Storage::snapshot(&storage, meta.index, 0).expect("snapshot");
         assert_eq!(s.get_metadata().index, meta.index);
+
+        cleanup(&sp, &rp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trigger_snapshot_compacts_log_past_keep_past() {
+        let (wrapper, sp, rp, raft_dir) =
+            setup_wrapper("raft_trigger_snapshot_compaction");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Drive enough writes that snapshot.index is well above
+        // keep_past — 10 schemas → 10 raft entries. With keep_past=2,
+        // compaction must drop entries [1..=8] and retain [9, 10].
+        for n in 0..10 {
+            wrapper
+                .create_schema(format!("s{}", n), false)
+                .await
+                .expect("create schema");
+        }
+
+        use raft::Storage;
+        let storage = wrapper.raft.storage();
+        let pre_first =
+            Storage::first_index(&storage).expect("pre first_index");
+        let pre_last =
+            Storage::last_index(&storage).expect("pre last_index");
+        assert!(
+            pre_last - pre_first >= 9,
+            "test wants ≥10 entries; pre log has {}..={}",
+            pre_first,
+            pre_last
+        );
+
+        let staging = raft_dir.path().join("snapshot-staging");
+        wrapper
+            .trigger_snapshot(&staging, 2)
+            .await
+            .expect("trigger_snapshot");
+
+        let post_first =
+            Storage::first_index(&storage).expect("post first_index");
+        let post_last =
+            Storage::last_index(&storage).expect("post last_index");
+
+        // last_index unchanged — compaction removes prefix only.
+        assert_eq!(post_last, pre_last, "compaction must not touch tail");
+
+        // first_index moved past the snapshot point. Specifically the
+        // surviving prefix is `applied - keep_past`. We don't pin the
+        // exact applied_index because it depends on whether the empty
+        // post-election entry counts; just assert it advanced.
+        assert!(
+            post_first > pre_first,
+            "first_index should advance: pre={} post={}",
+            pre_first,
+            post_first
+        );
+        assert!(
+            post_last - post_first <= 4,
+            "post-compaction log should be small (~keep_past + slack), got {}..={}",
+            post_first,
+            post_last
+        );
 
         cleanup(&sp, &rp);
     }
