@@ -142,6 +142,25 @@ impl RaftMetaStore {
         &self.store
     }
 
+    /// M6.1 — current leader id as observed by THIS replica's raft
+    /// state machine. `None` during election; `Some(id)` once a
+    /// leader is known. Reads are lock-free.
+    pub fn ha_leader_id(&self) -> Option<u64> {
+        self.raft.current_leader_id()
+    }
+
+    /// M6.1 — true if THIS replica is the raft leader. Hot-path
+    /// answer for readinessProbe / leader-only routing.
+    pub fn ha_is_leader_self(&self) -> bool {
+        self.raft.is_leader_self()
+    }
+
+    /// M6.1 — this replica's stable raft id (matches
+    /// `CUBESTORE_NODE_ID` config).
+    pub fn ha_node_id(&self) -> u64 {
+        self.raft.self_id()
+    }
+
     /// M5.4 + M5.5 — explicit snapshot trigger with log compaction.
     ///
     /// 1. Reads the current `applied_index` from the raft storage.

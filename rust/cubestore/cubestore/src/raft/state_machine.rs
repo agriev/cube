@@ -122,6 +122,16 @@ pub struct RaftNode {
     /// can read back applied/snapshot indices and persist new
     /// snapshots without waking the raft tick loop. M5.4.
     storage: SharedRaftStorage,
+    /// M6.1 — current leader id as observed by THIS replica's
+    /// `RawNode`. 0 means "no leader (election in progress / just
+    /// booted)". Updated by the raft tick loop on every state-
+    /// changing event so callers see fresh values within ~50 ms.
+    /// Atomic so reads are lock-free for hot-path callers like the
+    /// k8s readinessProbe endpoint.
+    current_leader_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// M6.1 — this replica's own id, captured at boot for the
+    /// `is_leader_self()` helper.
+    self_id: u64,
 }
 
 /// What kind of cluster this node is part of. Drives bootstrap-time
@@ -251,13 +261,32 @@ impl RaftNode {
         // loop.
         let storage_for_self = storage.clone();
 
+        // M6.1 — leader-id atomic shared between the raft tick loop
+        // and the public RaftNode handle. Updated inside the loop on
+        // every state change.
+        let current_leader_id = std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        );
+        let leader_id_for_loop = current_leader_id.clone();
+
         tokio::spawn(run_node(
-            raw, storage, rx, apply, pending, logger, transport_dyn, inbound_rx, kind,
+            raw,
+            storage,
+            rx,
+            apply,
+            pending,
+            logger,
+            transport_dyn,
+            inbound_rx,
+            kind,
+            leader_id_for_loop,
         ));
 
         Ok(Self {
             proposals: tx,
             storage: storage_for_self,
+            current_leader_id,
+            self_id: node_id,
         })
     }
 
@@ -279,6 +308,31 @@ impl RaftNode {
     /// snapshots without contending the raft tick loop.
     pub fn storage(&self) -> SharedRaftStorage {
         self.storage.clone()
+    }
+
+    /// M6.1 — current leader id as observed by THIS replica.
+    /// `None` means "no leader" (raft-rs returns 0 in that case);
+    /// `Some(id)` is the id of the current leader (could be self).
+    pub fn current_leader_id(&self) -> Option<u64> {
+        let v = self.current_leader_id.load(std::sync::atomic::Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// M6.1 — true if THIS replica is the leader. The hot-path
+    /// answer for k8s readinessProbe and the leader-only routing
+    /// hints in M6.2.
+    pub fn is_leader_self(&self) -> bool {
+        self.current_leader_id() == Some(self.self_id)
+    }
+
+    /// M6.1 — this replica's id. Useful for log messages that need
+    /// to identify the speaker without dragging the config in.
+    pub fn self_id(&self) -> u64 {
+        self.self_id
     }
 }
 
@@ -306,6 +360,7 @@ async fn run_node<A: Apply>(
     transport: Arc<dyn Transport>,
     mut inbound: mpsc::UnboundedReceiver<Message>,
     kind: ClusterKind,
+    current_leader_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let _ = logger; // reserved for future structured-log calls
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -333,13 +388,13 @@ async fn run_node<A: Apply>(
     // sentinel) doesn't count toward changes — we only count leader→
     // new-leader hops, not none→someone after election.
     let mut last_leader_id: u64 = 0;
-    publish_raft_metrics(&raw, &mut last_leader_id);
+    publish_raft_metrics(&raw, &mut last_leader_id, &current_leader_id);
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 raw.tick();
                 drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
-                publish_raft_metrics(&raw, &mut last_leader_id);
+                publish_raft_metrics(&raw, &mut last_leader_id, &current_leader_id);
             }
             maybe = proposals.recv() => {
                 match maybe {
@@ -370,7 +425,7 @@ async fn run_node<A: Apply>(
                         crate::app_metrics::RAFT_PROPOSALS_SUCCESS.increment();
                         pending.insert(next_index, p.respond_to);
                         drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
-                        publish_raft_metrics(&raw, &mut last_leader_id);
+                        publish_raft_metrics(&raw, &mut last_leader_id, &current_leader_id);
                     }
                     None => break,
                 }
@@ -386,7 +441,7 @@ async fn run_node<A: Apply>(
                             log::debug!("raft: step inbound failed: {:?}", e);
                         }
                         drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
-                        publish_raft_metrics(&raw, &mut last_leader_id);
+                        publish_raft_metrics(&raw, &mut last_leader_id, &current_leader_id);
                     }
                     None => {
                         // Inbound channel closed — transport is gone.
@@ -557,12 +612,18 @@ async fn apply_committed<A: Apply>(
     highest
 }
 
-/// Snapshot the current raft state into the operator-facing gauges.
-/// Cheap — just a few atomic stores per call. Called on every tick
-/// and after every state-changing path (propose, inbound, etc.) so
-/// the dashboard sees state changes within one tick of when they
-/// happen.
-fn publish_raft_metrics(raw: &RawNode<SharedRaftStorage>, last_leader_id: &mut u64) {
+/// Snapshot the current raft state into the operator-facing gauges
+/// AND the M6.1 shared atomic that lets out-of-loop callers (e.g.
+/// readinessProbe handler, leader-routing hint logic) read the
+/// current leader without locking. Cheap — just a few atomic stores
+/// per call. Called on every tick and after every state-changing
+/// path (propose, inbound, etc.) so the dashboard / introspection
+/// sees state changes within one tick of when they happen.
+fn publish_raft_metrics(
+    raw: &RawNode<SharedRaftStorage>,
+    last_leader_id: &mut u64,
+    current_leader_id: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
     let r = &raw.raft;
     crate::app_metrics::RAFT_TERM.report(r.term as i64);
     crate::app_metrics::RAFT_LEADER_ID.report(r.leader_id as i64);
@@ -573,6 +634,9 @@ fn publish_raft_metrics(raw: &RawNode<SharedRaftStorage>, last_leader_id: &mut u
     });
     crate::app_metrics::RAFT_COMMIT_INDEX.report(r.raft_log.committed as i64);
     crate::app_metrics::RAFT_APPLIED_INDEX.report(r.raft_log.applied as i64);
+
+    // M6.1 — make the leader id readable from outside the raft loop.
+    current_leader_id.store(r.leader_id, std::sync::atomic::Ordering::Relaxed);
 
     // Count leader-changes only on real hops (someone → someone-else).
     // The initial 0 → first-leader after election is bootstrap noise.
@@ -1576,4 +1640,116 @@ mod tests {
     // leader → ship over MsgSnapshot → install on follower) belongs
     // in the M8 chaos suite where we run full RaftMetaStore
     // instances on real ports. Tracked there.
+
+    // =========================================================================
+    // M6.1 — leader-id introspection from outside the raft loop
+    // =========================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_node_cluster_exposes_leader_id_to_callers() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let dir3 = TempDir::new().unwrap();
+
+        let transport = Arc::new(LocalLoopback::new());
+        let (in1, rx1) = Inbound::new();
+        let (in2, rx2) = Inbound::new();
+        let (in3, rx3) = Inbound::new();
+        transport.register(1, in1);
+        transport.register(2, in2);
+        transport.register(3, in3);
+
+        let apply1 = Arc::new(RecordingApply::new());
+        let apply2 = Arc::new(RecordingApply::new());
+        let apply3 = Arc::new(RecordingApply::new());
+
+        let n1 = RaftNode::start_multi_node(
+            dir1.path(), 1, vec![1, 2, 3],
+            Arc::clone(&apply1), Arc::clone(&transport), rx1,
+        ).expect("start n1");
+        let n2 = RaftNode::start_multi_node(
+            dir2.path(), 2, vec![1, 2, 3],
+            Arc::clone(&apply2), Arc::clone(&transport), rx2,
+        ).expect("start n2");
+        let n3 = RaftNode::start_multi_node(
+            dir3.path(), 3, vec![1, 2, 3],
+            Arc::clone(&apply3), Arc::clone(&transport), rx3,
+        ).expect("start n3");
+
+        let nodes = vec![(1u64, n1), (2u64, n2), (3u64, n3)];
+
+        // Wait for an election to settle. await_leader proves a
+        // leader was actually elected (it proposes a no-op and a
+        // follower would reject); the elected leader's id may
+        // legitimately change again before the next assertion (e.g.
+        // a re-election triggered by tick-timer drift on a busy
+        // worker thread), so we don't pin to await_leader's return
+        // value below. We just need ANY leader to have been elected.
+        let _ = await_leader(&nodes, Duration::from_secs(15)).await;
+
+        // Self-id reports correctly on each replica.
+        for (id, node) in &nodes {
+            assert_eq!(node.self_id(), *id);
+        }
+
+        // After election, EVERY replica's `current_leader_id` should
+        // converge on the SAME id (whoever the current leader is —
+        // could differ from await_leader's witness if another
+        // election happened in the meantime). That's the key M6.1
+        // guarantee: a follower can answer "who's the leader?"
+        // from its own raft state.
+        // Polling because metric publication runs on the tick loop
+        // (~50 ms cadence); give a few ticks to settle.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let agreed_leader = loop {
+            let ids: Vec<Option<u64>> = nodes
+                .iter()
+                .map(|(_, n)| n.current_leader_id())
+                .collect();
+            // All-Some-and-equal? Take it.
+            if let Some(first) = ids[0] {
+                if ids.iter().all(|x| *x == Some(first)) {
+                    break first;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "current_leader_id never converged on all 3 nodes: {:?}",
+                    ids
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        // The agreed leader must be one of {1, 2, 3}.
+        assert!(
+            (1..=3).contains(&agreed_leader),
+            "agreed leader id out of range: {}",
+            agreed_leader
+        );
+
+        // Exactly one replica should report `is_leader_self() == true`,
+        // and that's the agreed-upon leader.
+        // We re-read self-reports here in case state shifted between
+        // the loop above and this assertion. If we observe ZERO or
+        // TWO self-leaders momentarily that's a real protocol bug.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let leaders: Vec<u64> = nodes
+                .iter()
+                .filter(|(_, n)| n.is_leader_self())
+                .map(|(id, _)| *id)
+                .collect();
+            if leaders.len() == 1 && leaders[0] == agreed_leader {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "expected exactly one self-leader == {}, got {:?}",
+                    agreed_leader, leaders
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
