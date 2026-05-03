@@ -138,6 +138,32 @@ pub static REMOTE_FS_FILES_TO_REMOVE: Gauge = metrics::gauge("cs.remote_fs.files
 pub static REMOTE_FS_FILES_SIZE_TO_REMOVE: Gauge =
     metrics::gauge("cs.remote_fs.files_to_remove.size");
 
+/// HA fork — Raft metrics (M9.1).
+///
+/// Operator-facing signals for the HA cluster. Exported under the
+/// `cs.raft.*` namespace; the existing prometheus / statsd
+/// infrastructure picks them up unchanged. The Grafana dashboard
+/// (M9.2) builds on these:
+///
+/// - `cs.raft.term` rising rapidly = election storm (split vote,
+///   tick budget too tight, or genuine network instability).
+/// - `cs.raft.leader_id` changing = leader changeover. A few of these
+///   per day is normal during rolling restarts; a sustained
+///   stream signals a problem.
+/// - `cs.raft.commit_index` flat for >30s on a node with non-empty
+///   pending = stuck cluster (no quorum).
+/// - `cs.raft.applied_index` lagging `commit_index` = apply path
+///   slow (rocksdb backpressure or a stuck `MetaStore` write).
+pub static RAFT_TERM: Gauge = metrics::gauge("cs.raft.term");
+pub static RAFT_LEADER_ID: Gauge = metrics::gauge("cs.raft.leader_id");
+pub static RAFT_IS_LEADER: Gauge = metrics::gauge("cs.raft.is_leader");
+pub static RAFT_COMMIT_INDEX: Gauge = metrics::gauge("cs.raft.commit_index");
+pub static RAFT_APPLIED_INDEX: Gauge = metrics::gauge("cs.raft.applied_index");
+pub static RAFT_LEADER_CHANGES: Counter = metrics::counter("cs.raft.leader_changes");
+pub static RAFT_PROPOSALS_SUCCESS: Counter = metrics::counter("cs.raft.proposals.success");
+pub static RAFT_PROPOSALS_FAILED: Counter = metrics::counter("cs.raft.proposals.failed");
+pub static RAFT_APPLY_DURATION_MS: Histogram = metrics::histogram("cs.raft.apply.duration_ms");
+
 /// Cache Store Cache
 pub static CACHESTORE_TTL_PERSIST: Counter = metrics::counter("cs.cachestore.ttl.persist");
 pub static CACHESTORE_TTL_BUFFER: Gauge = metrics::gauge("cs.cachestore.ttl.buffer");

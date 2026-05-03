@@ -308,11 +308,18 @@ async fn run_node<A: Apply>(
     }
     drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
 
+    // Track the last leader id we saw so we can increment the
+    // leader-changes counter on transitions. 0 (raft-rs's "no leader"
+    // sentinel) doesn't count toward changes — we only count leader→
+    // new-leader hops, not none→someone after election.
+    let mut last_leader_id: u64 = 0;
+    publish_raft_metrics(&raw, &mut last_leader_id);
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 raw.tick();
                 drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+                publish_raft_metrics(&raw, &mut last_leader_id);
             }
             maybe = proposals.recv() => {
                 match maybe {
@@ -320,6 +327,7 @@ async fn run_node<A: Apply>(
                         let bytes = match p.command.encode() {
                             Ok(b) => b,
                             Err(e) => {
+                                crate::app_metrics::RAFT_PROPOSALS_FAILED.increment();
                                 let _ = p.respond_to.send(Err(CubeError::internal(format!(
                                     "MetaCommand encode failed: {}", e
                                 ))));
@@ -333,13 +341,16 @@ async fn run_node<A: Apply>(
                         // leader (M4.5) or fail back to the caller.
                         let next_index = raw.raft.raft_log.last_index() + 1;
                         if let Err(e) = raw.propose(vec![], bytes) {
+                            crate::app_metrics::RAFT_PROPOSALS_FAILED.increment();
                             let _ = p.respond_to.send(Err(CubeError::internal(format!(
                                 "raft propose failed: {:?}", e
                             ))));
                             continue;
                         }
+                        crate::app_metrics::RAFT_PROPOSALS_SUCCESS.increment();
                         pending.insert(next_index, p.respond_to);
                         drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+                        publish_raft_metrics(&raw, &mut last_leader_id);
                     }
                     None => break,
                 }
@@ -355,6 +366,7 @@ async fn run_node<A: Apply>(
                             log::debug!("raft: step inbound failed: {:?}", e);
                         }
                         drive_ready(&mut raw, &storage, &apply, &mut pending, transport.as_ref()).await;
+                        publish_raft_metrics(&raw, &mut last_leader_id);
                     }
                     None => {
                         // Inbound channel closed — transport is gone.
@@ -468,6 +480,7 @@ async fn apply_committed<A: Apply>(
         // field (rust-protobuf 2.x style), not a method.
         match ent.entry_type {
             EntryType::EntryNormal => {
+                let started = std::time::Instant::now();
                 let result = match MetaCommand::decode(&ent.data) {
                     Ok(cmd) => apply.apply(cmd).await,
                     Err(e) => Err(CubeError::internal(format!(
@@ -475,6 +488,8 @@ async fn apply_committed<A: Apply>(
                         ent.index, e
                     ))),
                 };
+                crate::app_metrics::RAFT_APPLY_DURATION_MS
+                    .report(started.elapsed().as_millis() as i64);
                 if let Some(tx) = pending.remove(&ent.index) {
                     let _ = tx.send(result);
                 }
@@ -485,6 +500,33 @@ async fn apply_committed<A: Apply>(
         }
     }
     highest
+}
+
+/// Snapshot the current raft state into the operator-facing gauges.
+/// Cheap — just a few atomic stores per call. Called on every tick
+/// and after every state-changing path (propose, inbound, etc.) so
+/// the dashboard sees state changes within one tick of when they
+/// happen.
+fn publish_raft_metrics(raw: &RawNode<SharedRaftStorage>, last_leader_id: &mut u64) {
+    let r = &raw.raft;
+    crate::app_metrics::RAFT_TERM.report(r.term as i64);
+    crate::app_metrics::RAFT_LEADER_ID.report(r.leader_id as i64);
+    crate::app_metrics::RAFT_IS_LEADER.report(if r.state == raft::StateRole::Leader {
+        1
+    } else {
+        0
+    });
+    crate::app_metrics::RAFT_COMMIT_INDEX.report(r.raft_log.committed as i64);
+    crate::app_metrics::RAFT_APPLIED_INDEX.report(r.raft_log.applied as i64);
+
+    // Count leader-changes only on real hops (someone → someone-else).
+    // The initial 0 → first-leader after election is bootstrap noise.
+    if r.leader_id != 0 && *last_leader_id != 0 && r.leader_id != *last_leader_id {
+        crate::app_metrics::RAFT_LEADER_CHANGES.increment();
+    }
+    if r.leader_id != 0 {
+        *last_leader_id = r.leader_id;
+    }
 }
 
 fn build_drain_logger() -> slog::Logger {
