@@ -3,13 +3,15 @@
 This is a **fork** of [cube-js/cube](https://github.com/cube-js/cube) that adds
 **high availability** to the OSS Cube Store router.
 
-> **Status: M3 of 10 complete — single-node Raft replication for metastore writes works
-> end-to-end; the upstream `cubestore-sql-tests` in-process suite passes under
+> **Status: M3 + M4 of 10 complete — multi-node Raft consensus over real
+> TCP works end-to-end; 3-node clusters elect a leader, replicate writes
+> to all followers, and survive a partitioned-leader failover. The
+> upstream `cubestore-sql-tests` in-process suite passes under
 > `CUBESTORE_HA_MODE=raft` in CI.**
 >
-> Multi-node clustering (M4) and the rest of the production-readiness
-> milestones (snapshots, leader-aware routing, Helm chart, observability,
-> docs) are still ahead. Do not deploy to production. Track
+> Snapshots/log-compaction (M5), leader-aware client routing (M6), Helm
+> chart wiring (M7), and the rest of the production-readiness milestones
+> are still ahead. Do not deploy to production until M5–M8 land. Track
 > [ROADMAP](#roadmap) below.
 
 ## Why this fork exists
@@ -76,8 +78,8 @@ to whether replication is on. See [HA design plan](docs/ha/PLAN.md).
 | M1 | `raft-rs` crate + `MetaCommand` enum scaffolding | ✅ **done** |
 | M2 | Single-node Raft with local RocksDB log | ✅ **done** |
 | M3 | Wire all `MetaStore` writes through the apply path | ✅ **done** (`m3-complete`) |
-| M4 | 3-node clustering, leader election, follower replication | next |
-| M5 | Snapshot + log compaction over `RemoteFs` | todo |
+| M4 | 3-node clustering, leader election, follower replication | ✅ **done** (`m4-complete`) |
+| M5 | Snapshot + log compaction over `RemoteFs` | next |
 | M6 | Leader-aware client routing (Cube API + workers) | todo |
 | M7 | Helm chart updates (`agriev/cube-stack-deployment`) | todo |
 | M8 | Chaos & soak tests (kill -9, drain, partition) | todo |
@@ -123,7 +125,7 @@ cd rust/cubestore
 cargo build --release
 ```
 
-To run with HA mode (single-node post-M3):
+To run with HA mode (single-node):
 
 ```bash
 CUBESTORE_HA_MODE=raft \
@@ -131,14 +133,34 @@ CUBESTORE_NODE_ID=1 \
 ./target/release/cubestored
 ```
 
-The metastore now routes every write through Raft on the local node;
-the wrapper is `RaftMetaStore` (single-node only — multi-node clustering
-lands in M4). HA-mode envs `CUBESTORE_HA_MODE`, `CUBESTORE_NODE_ID`,
-`CUBESTORE_HA_RAFT_LOG_DIR` are wired into `Config::default()`.
+The metastore routes every write through Raft on the local node; the
+wrapper is `RaftMetaStore`. With no `CUBESTORE_RAFT_PEERS` set this
+runs as a 1-voter cluster — useful for dev/smoke tests.
 
-The HA mode is **not yet production-ready** — multi-node clustering
-(M4), snapshots (M5), leader-aware routing (M6) and the rest of the
-deployment story are still ahead.
+To run as a multi-node cluster (3-node example, post-M4):
+
+```bash
+# router-0
+CUBESTORE_HA_MODE=raft \
+CUBESTORE_NODE_ID=1 \
+CUBESTORE_RAFT_PEERS="1@router-0:9100,2@router-1:9100,3@router-2:9100" \
+CUBESTORE_RAFT_PORT=9100 \
+./target/release/cubestored
+
+# router-1 (CUBESTORE_NODE_ID=2), router-2 (CUBESTORE_NODE_ID=3) follow
+# the same pattern. Every node MUST list itself in CUBESTORE_RAFT_PEERS
+# — boot panics otherwise.
+```
+
+Each replica binds `0.0.0.0:CUBESTORE_RAFT_PORT` and dials its peers
+lazily. Election is timer-driven (no node calls `campaign()` at boot).
+A committed write replicates to every voter's local RocksDB before
+the proposer's API call returns, and a partitioned leader yields to a
+new one within seconds.
+
+The HA mode is **not yet production-ready** — snapshot / log
+compaction (M5), leader-aware client routing (M6), Helm-chart
+wiring (M7), and observability (M9) are still ahead.
 
 To run the SQL test suite under HA mode:
 
