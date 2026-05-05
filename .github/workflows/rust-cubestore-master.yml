@@ -206,6 +206,23 @@ jobs:
           key: target-${{ matrix.target }}
       - uses: ilammy/msvc-dev-cmd@v1
         if: ${{ startsWith(matrix.os, 'windows') }}
+      - name: Install macOS build prereqs (protobuf 21)
+        # `raft-proto` (transitive from raft-rs) needs `protoc >= 3.1`,
+        # but its `protobuf-build` crate at v0.14.1 has a parser that
+        # rejects the new protoc 4+ versioning (Google renumbered).
+        # Homebrew's mainline `protobuf` formula is now at v34+ which
+        # parses as "34.1.x" → rejected. The bundled fallback ships
+        # only for x86_64-osx, so aarch64-apple-darwin panics without
+        # an explicit 3.x install. Pin to `protobuf@21` (frozen
+        # versioned formula = protoc 3.21.x). The linux runners get
+        # the same vintage by default inside the rust-builder image.
+        if: ${{ startsWith(matrix.os, 'macos') }}
+        run: |
+          brew install protobuf@21 || true
+          PROTOBUF_BIN="$(brew --prefix protobuf@21)/bin"
+          echo "$PROTOBUF_BIN" >> "$GITHUB_PATH"
+          echo "PROTOC=$PROTOBUF_BIN/protoc" >> "$GITHUB_ENV"
+          "$PROTOBUF_BIN/protoc" --version
       - name: Install OpenSSL for Windows
         if: ${{ startsWith(matrix.os, 'windows') }}
         run: vcpkg integrate install; vcpkg install openssl:x64-windows

@@ -145,6 +145,18 @@ jobs:
           key: target-${{ matrix.target }}
       - uses: ilammy/msvc-dev-cmd@v1
         if: ${{ startsWith(matrix.os, 'windows') }}
+      - name: Install macOS build prereqs (protobuf 21)
+        # See rust-cubestore-master.yml for the full rationale —
+        # protobuf-build 0.14.1 rejects protoc 4+ versioning, and the
+        # bundled fallback covers only x86_64-osx, so aarch64 mac
+        # needs an explicit 3.x install via the protobuf@21 formula.
+        if: ${{ startsWith(matrix.os, 'macos') }}
+        run: |
+          brew install protobuf@21 || true
+          PROTOBUF_BIN="$(brew --prefix protobuf@21)/bin"
+          echo "$PROTOBUF_BIN" >> "$GITHUB_PATH"
+          echo "PROTOC=$PROTOBUF_BIN/protoc" >> "$GITHUB_ENV"
+          "$PROTOBUF_BIN/protoc" --version
       - name: Install OpenSSL for Windows
         if: ${{ startsWith(matrix.os, 'windows') }}
         run: vcpkg integrate install; vcpkg install openssl:x64-windows
