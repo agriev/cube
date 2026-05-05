@@ -2418,9 +2418,7 @@ impl Config {
                     // for every persistent DateTime field; see
                     // docs/ha/M3.4-AUDIT.md). Booting via the Raft
                     // path is supported — info-level breadcrumb only.
-                    log::info!(
-                        "CUBESTORE_HA_MODE=raft enabled — booting RaftMetaStore"
-                    );
+                    log::info!("CUBESTORE_HA_MODE=raft enabled — booting RaftMetaStore");
 
                     // Use the pre-cloned sender for the Raft arm so
                     // the Off arm above can still consume the

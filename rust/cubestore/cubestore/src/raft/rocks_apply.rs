@@ -1007,11 +1007,7 @@ mod tests {
     /// Stronger than `==` because it catches divergence in fields
     /// `PartialEq` skips (none today, but defensive against future
     /// `#[serde(skip)]` regressions).
-    fn assert_rows_byte_equal<T: Serialize + Clone>(
-        label: &str,
-        a: &IdRow<T>,
-        b: &IdRow<T>,
-    ) {
+    fn assert_rows_byte_equal<T: Serialize + Clone>(label: &str, a: &IdRow<T>, b: &IdRow<T>) {
         let ba = flex_encode(a);
         let bb = flex_encode(b);
         assert_eq!(
@@ -1032,7 +1028,10 @@ mod tests {
         // Picked to be far from any real wall clock so a stray
         // `Utc::now()` regression would jump out by orders of magnitude.
         let assigned_now_millis: i64 = 1_600_000_000_000;
-        let leader_now = Utc.timestamp_millis_opt(assigned_now_millis).single().unwrap();
+        let leader_now = Utc
+            .timestamp_millis_opt(assigned_now_millis)
+            .single()
+            .unwrap();
 
         // ---- 1. Schema ------------------------------------------------
         // (no time field — but every table needs one)
@@ -1104,10 +1103,7 @@ mod tests {
         );
         // Stamp the leader-clock manually so the test doesn't depend on
         // the host wall clock's nanosecond precision.
-        job = job.update_status_pure(
-            JobStatus::Scheduled("shard-0".into()),
-            leader_now,
-        );
+        job = job.update_status_pure(JobStatus::Scheduled("shard-0".into()), leader_now);
         let job_blob = flex_encode(&job);
 
         for apply in [&apply_a, &apply_b] {
