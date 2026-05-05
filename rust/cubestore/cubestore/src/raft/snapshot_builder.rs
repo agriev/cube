@@ -95,15 +95,18 @@ pub async fn build_state_machine_snapshot_bytes(
 
     // Pack the checkpoint dir into the bytes that go into the
     // raft Snapshot. Once packed we don't need the dir anymore.
-    let bytes = snapshot_payload::pack_dir(&staging_dir).map_err(|e| {
-        CubeError::internal(format!("pack_dir({:?}): {}", staging_dir, e))
-    })?;
+    let bytes = snapshot_payload::pack_dir(&staging_dir)
+        .map_err(|e| CubeError::internal(format!("pack_dir({:?}): {}", staging_dir, e)))?;
 
     // Best-effort cleanup. A leftover staging dir is harmless (gets
     // GC'd on the next snapshot) but noisy; log on failure rather
     // than escalate.
     if let Err(e) = std::fs::remove_dir_all(&staging_dir) {
-        log::warn!("snapshot staging dir cleanup failed: {:?}: {}", staging_dir, e);
+        log::warn!(
+            "snapshot staging dir cleanup failed: {:?}: {}",
+            staging_dir,
+            e
+        );
     }
 
     Ok(bytes)
@@ -117,16 +120,12 @@ pub async fn build_state_machine_snapshot_bytes(
 /// it if needed. The caller is responsible for the atomic swap
 /// from `target_dir` into the live RocksMetaStore path — see the
 /// module docstring for why M5.6 owns that step.
-pub fn apply_snapshot_to_dir(
-    snapshot_data: &[u8],
-    target_dir: &Path,
-) -> Result<(), CubeError> {
+pub fn apply_snapshot_to_dir(snapshot_data: &[u8], target_dir: &Path) -> Result<(), CubeError> {
     if target_dir.exists() {
         // Refuse to overwrite — staleness here would be a silent
         // data-corruption bug. The caller should pass a fresh path.
-        let mut entries = std::fs::read_dir(target_dir).map_err(|e| {
-            CubeError::internal(format!("read_dir {:?}: {}", target_dir, e))
-        })?;
+        let mut entries = std::fs::read_dir(target_dir)
+            .map_err(|e| CubeError::internal(format!("read_dir {:?}: {}", target_dir, e)))?;
         if entries.next().is_some() {
             return Err(CubeError::internal(format!(
                 "apply_snapshot_to_dir: target {:?} is not empty",
@@ -186,8 +185,7 @@ mod tests {
         let restored = TempDir::new().unwrap();
         // unpack_dir refuses non-empty target — drop and recreate.
         std::fs::remove_dir_all(restored.path()).unwrap();
-        apply_snapshot_to_dir(&bytes, restored.path())
-            .expect("apply snapshot to dir");
+        apply_snapshot_to_dir(&bytes, restored.path()).expect("apply snapshot to dir");
 
         // The restored dir should contain RocksDB checkpoint files
         // (MANIFEST-*, *.sst, OPTIONS, IDENTITY, CURRENT). At
@@ -240,7 +238,11 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(staging_root.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot-staging-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("snapshot-staging-")
+            })
             .collect();
         assert!(
             leftovers.is_empty(),

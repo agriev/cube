@@ -1684,10 +1684,7 @@ impl RocksMetaStore {
     ///
     /// Outside HA mode this is also a convenient escape hatch for
     /// callers that want explicit control over `Chunk` fields.
-    pub async fn insert_chunk_pre_built(
-        &self,
-        chunk: Chunk,
-    ) -> Result<IdRow<Chunk>, CubeError> {
+    pub async fn insert_chunk_pre_built(&self, chunk: Chunk) -> Result<IdRow<Chunk>, CubeError> {
         self.write_operation("insert_chunk_pre_built", move |db_ref, batch_pipe| {
             let rocks_chunk = ChunkRocksTable::new(db_ref);
             Ok(rocks_chunk.insert(chunk, batch_pipe)?)
@@ -1731,11 +1728,12 @@ impl RocksMetaStore {
         self.write_operation(
             "create_replay_handle_from_seq_pointers",
             move |db_ref, batch_pipe| {
-                let handle = crate::metastore::replay_handle::ReplayHandle::new_from_seq_pointers_pure(
-                    table_id,
-                    seq_pointers,
-                    now,
-                );
+                let handle =
+                    crate::metastore::replay_handle::ReplayHandle::new_from_seq_pointers_pure(
+                        table_id,
+                        seq_pointers,
+                        now,
+                    );
                 Ok(ReplayHandleRocksTable::new(db_ref.clone()).insert(handle, batch_pipe)?)
             },
         )
@@ -4449,7 +4447,8 @@ impl MetaStore for RocksMetaStore {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn update_status(&self, job_id: u64, status: JobStatus) -> Result<IdRow<Job>, CubeError> {
-        self.update_status_with_now(job_id, status, Utc::now()).await
+        self.update_status_with_now(job_id, status, Utc::now())
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

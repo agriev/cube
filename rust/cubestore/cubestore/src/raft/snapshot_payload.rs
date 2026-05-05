@@ -274,8 +274,14 @@ mod tests {
         let dst = TempDir::new().unwrap();
         unpack_dir(&bytes, dst.path()).unwrap();
 
-        assert_eq!(fs::read(dst.path().join("MANIFEST-000001")).unwrap(), b"manifest-bytes");
-        assert_eq!(fs::read(dst.path().join("000003.sst")).unwrap(), b"sst-bytes");
+        assert_eq!(
+            fs::read(dst.path().join("MANIFEST-000001")).unwrap(),
+            b"manifest-bytes"
+        );
+        assert_eq!(
+            fs::read(dst.path().join("000003.sst")).unwrap(),
+            b"sst-bytes"
+        );
         assert_eq!(fs::read(dst.path().join("OPTIONS")).unwrap(), b"options");
     }
 
@@ -289,7 +295,10 @@ mod tests {
         let dst = TempDir::new().unwrap();
         unpack_dir(&bytes, dst.path()).unwrap();
 
-        assert_eq!(fs::read(dst.path().join("files/sub/000001.sst")).unwrap(), b"deep");
+        assert_eq!(
+            fs::read(dst.path().join("files/sub/000001.sst")).unwrap(),
+            b"deep"
+        );
         assert_eq!(fs::read(dst.path().join("top.txt")).unwrap(), b"shallow");
     }
 

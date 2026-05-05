@@ -228,7 +228,8 @@ impl RaftStorage {
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| RaftStorageError::Inconsistent("meta CF missing".into()))?;
-        self.db.put_cf_opt(cf, META_KEY_APPLIED_INDEX, bytes, &sync_write())?;
+        self.db
+            .put_cf_opt(cf, META_KEY_APPLIED_INDEX, bytes, &sync_write())?;
         Ok(())
     }
 
@@ -237,18 +238,15 @@ impl RaftStorage {
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| RaftStorageError::Inconsistent("meta CF missing".into()))?;
-        Ok(self
-            .db
-            .get_cf(cf, META_KEY_APPLIED_INDEX)?
-            .and_then(|b| {
-                let mut buf = [0u8; 8];
-                if b.len() == 8 {
-                    buf.copy_from_slice(&b);
-                    Some(u64::from_be_bytes(buf))
-                } else {
-                    None
-                }
-            }))
+        Ok(self.db.get_cf(cf, META_KEY_APPLIED_INDEX)?.and_then(|b| {
+            let mut buf = [0u8; 8];
+            if b.len() == 8 {
+                buf.copy_from_slice(&b);
+                Some(u64::from_be_bytes(buf))
+            } else {
+                None
+            }
+        }))
     }
 
     /// Compact log up to (but not including) `compact_to`. After a
@@ -299,10 +297,7 @@ impl RaftStorage {
         let final_path = self.snapshot_data_path();
         let tmp_path = self.dir.join(format!("{}.tmp", SNAPSHOT_DATA_FILE));
         std::fs::write(&tmp_path, snapshot.get_data()).map_err(|e| {
-            RaftStorageError::Inconsistent(format!(
-                "snapshot data write to {:?}: {}",
-                tmp_path, e
-            ))
+            RaftStorageError::Inconsistent(format!("snapshot data write to {:?}: {}", tmp_path, e))
         })?;
         std::fs::rename(&tmp_path, &final_path).map_err(|e| {
             RaftStorageError::Inconsistent(format!(
@@ -550,7 +545,9 @@ impl Storage for RaftStorage {
         // shipping path open via MsgAppend rather than MsgSnapshot.
         match self.read_snapshot() {
             Ok(Some(snap)) if snap.get_metadata().index >= request_index => Ok(snap),
-            Ok(_) => Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable)),
+            Ok(_) => Err(raft::Error::Store(
+                StorageError::SnapshotTemporarilyUnavailable,
+            )),
             Err(e) => Err(storage_unavailable(e)),
         }
     }
@@ -697,11 +694,7 @@ fn sync_write() -> WriteOptions {
     wo
 }
 
-fn put_meta<T: ProtobufMessage>(
-    db: &DB,
-    key: &[u8],
-    value: &T,
-) -> Result<(), RaftStorageError> {
+fn put_meta<T: ProtobufMessage>(db: &DB, key: &[u8], value: &T) -> Result<(), RaftStorageError> {
     let cf = db
         .cf_handle(CF_META)
         .ok_or_else(|| RaftStorageError::Inconsistent("meta CF missing".into()))?;
@@ -710,10 +703,7 @@ fn put_meta<T: ProtobufMessage>(
     Ok(())
 }
 
-fn get_meta<T: ProtobufMessage>(
-    db: &DB,
-    key: &[u8],
-) -> Result<Option<T>, RaftStorageError> {
+fn get_meta<T: ProtobufMessage>(db: &DB, key: &[u8]) -> Result<Option<T>, RaftStorageError> {
     let cf = db
         .cf_handle(CF_META)
         .ok_or_else(|| RaftStorageError::Inconsistent("meta CF missing".into()))?;
@@ -963,7 +953,9 @@ mod tests {
         // saved — raft-rs uses that to retry on the MsgAppend path.
         assert!(matches!(
             s.snapshot(0, 0),
-            Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+            Err(raft::Error::Store(
+                StorageError::SnapshotTemporarilyUnavailable
+            ))
         ));
     }
 
@@ -973,7 +965,8 @@ mod tests {
         let s = RaftStorage::open(dir.path(), vec![1]).unwrap();
         assert_eq!(s.snapshot_index().unwrap(), 0);
 
-        s.save_snapshot(&make_snapshot(5, 1, vec![1], b"first")).unwrap();
+        s.save_snapshot(&make_snapshot(5, 1, vec![1], b"first"))
+            .unwrap();
         assert_eq!(s.snapshot_index().unwrap(), 5);
 
         // Overwrite with a newer snapshot — only the latest is retained.
@@ -1015,7 +1008,9 @@ mod tests {
         // request_index > snapshot.index → must wait for a newer one.
         assert!(matches!(
             s.snapshot(100, 0),
-            Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+            Err(raft::Error::Store(
+                StorageError::SnapshotTemporarilyUnavailable
+            ))
         ));
     }
 
@@ -1068,10 +1063,7 @@ mod tests {
         assert_eq!(s.last_index().unwrap(), 50);
 
         // ConfState updated.
-        assert_eq!(
-            s.conf_state.read().unwrap().voters,
-            vec![1, 2, 3]
-        );
+        assert_eq!(s.conf_state.read().unwrap().voters, vec![1, 2, 3]);
 
         // HardState: term advanced, commit jumped.
         let hs = s.hard_state.read().unwrap().clone();

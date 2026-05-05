@@ -281,7 +281,10 @@ async fn run_recv_loop(mut sock: TcpStream, inbound: Inbound) -> std::io::Result
         if ver != FRAME_VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("raft frame version mismatch: got {}, want {}", ver, FRAME_VERSION),
+                format!(
+                    "raft frame version mismatch: got {}, want {}",
+                    ver, FRAME_VERSION
+                ),
             ));
         }
         let len = sock.read_u32().await?;
@@ -344,27 +347,21 @@ impl PeerConn {
         // but DNS / pod-startup transients can stretch this. After
         // 3 s we treat the peer as dead and let raft retry on the
         // next heartbeat.
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(3),
-            TcpStream::connect(&self.addr),
-        )
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("connect timeout to {}", self.addr),
-            )
-        })??;
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&self.addr))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("connect timeout to {}", self.addr),
+                    )
+                })??;
         let _ = stream.set_nodelay(true);
 
         // Bound the write at 2 s. Heartbeats are <1 KiB and SST
         // shipping is gated by raft-rs's max_size_per_msg = 1 MiB,
         // both well under what 2 s of TCP can move on healthy LAN.
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            write_frame(&mut stream, &payload),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(2), write_frame(&mut stream, &payload)).await
         {
             Ok(r) => r,
             Err(_) => Err(std::io::Error::new(
@@ -457,7 +454,11 @@ impl Transport for TcpTransport {
         let payload = match msg.write_to_bytes() {
             Ok(b) => b,
             Err(e) => {
-                log::warn!("raft transport: failed to serialize msg to peer {}: {}", target, e);
+                log::warn!(
+                    "raft transport: failed to serialize msg to peer {}: {}",
+                    target,
+                    e
+                );
                 return;
             }
         };
@@ -624,8 +625,7 @@ mod tests {
         // a couple to cover the race deterministically.
         for _ in 0..3 {
             transport.send(sample_msg(1, 2, 2)).await;
-            if let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(500), rx2.recv()).await
+            if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(500), rx2.recv()).await
             {
                 return; // recovered
             }
@@ -652,6 +652,9 @@ mod tests {
         // Server should drop this connection. Verify the inbound
         // channel saw nothing.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(rx.try_recv().is_err(), "inbound must not receive on bad magic");
+        assert!(
+            rx.try_recv().is_err(),
+            "inbound must not receive on bad magic"
+        );
     }
 }

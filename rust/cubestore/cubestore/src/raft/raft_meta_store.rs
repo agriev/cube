@@ -60,8 +60,8 @@ use crate::metastore::source::{Source, SourceCredentials};
 use crate::metastore::table::{StreamOffset, Table, TablePath};
 use crate::metastore::{
     Chunk, ChunkMetaStoreTable, Column, IdRow, ImportFormat, Index, IndexDef, IndexMetaStoreTable,
-    MetaStore, Partition, PartitionData, PartitionMetaStoreTable, RocksMetaStore,
-    RocksPropertyRow, RowKey, Schema, SchemaMetaStoreTable, TableMetaStoreTable, WAL,
+    MetaStore, Partition, PartitionData, PartitionMetaStoreTable, RocksMetaStore, RocksPropertyRow,
+    RowKey, Schema, SchemaMetaStoreTable, TableMetaStoreTable, WAL,
 };
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResultMismatch};
 use crate::raft::rocks_apply::RocksMetaStoreApply;
@@ -246,8 +246,7 @@ impl RaftMetaStore {
 
         // Build the state-machine bytes via M5.3.
         let data =
-            snapshot_builder::build_state_machine_snapshot_bytes(&self.store, staging_root)
-                .await?;
+            snapshot_builder::build_state_machine_snapshot_bytes(&self.store, staging_root).await?;
 
         // Persist via M5.1.
         let mut snapshot = raft::eraftpb::Snapshot::default();
@@ -677,7 +676,9 @@ impl MetaStore for RaftMetaStore {
         self.store.can_delete_partition(partition_id).await
     }
     async fn can_delete_middle_man_partition(&self, partition_id: u64) -> Result<bool, CubeError> {
-        self.store.can_delete_middle_man_partition(partition_id).await
+        self.store
+            .can_delete_middle_man_partition(partition_id)
+            .await
     }
     async fn all_inactive_partitions_to_repartition(
         &self,
@@ -710,7 +711,9 @@ impl MetaStore for RaftMetaStore {
         )>,
         CubeError,
     > {
-        self.store.get_partitions_for_in_memory_compaction(node).await
+        self.store
+            .get_partitions_for_in_memory_compaction(node)
+            .await
     }
     async fn get_all_node_in_memory_chunks(
         &self,
@@ -859,10 +862,16 @@ impl MetaStore for RaftMetaStore {
         // M3.7: route through Raft. Old/new_partitions are flex-blobs
         // because they nest IdRow<Partition>/IdRow<Chunk> from the
         // metastore module.
-        let old_partitions_blob =
-            Self::encode_blob("commit_multi_partition_split", "old_partitions", &old_partitions)?;
-        let new_partitions_blob =
-            Self::encode_blob("commit_multi_partition_split", "new_partitions", &new_partitions)?;
+        let old_partitions_blob = Self::encode_blob(
+            "commit_multi_partition_split",
+            "old_partitions",
+            &old_partitions,
+        )?;
+        let new_partitions_blob = Self::encode_blob(
+            "commit_multi_partition_split",
+            "new_partitions",
+            &new_partitions,
+        )?;
         self.raft
             .propose(MetaCommand::CommitMultiPartitionSplit {
                 multi_partition_id,
@@ -951,10 +960,7 @@ impl MetaStore for RaftMetaStore {
     async fn get_chunk(&self, chunk_id: u64) -> Result<IdRow<Chunk>, CubeError> {
         self.store.get_chunk(chunk_id).await
     }
-    async fn get_chunks_out_of_queue(
-        &self,
-        ids: Vec<u64>,
-    ) -> Result<Vec<IdRow<Chunk>>, CubeError> {
+    async fn get_chunks_out_of_queue(&self, ids: Vec<u64>) -> Result<Vec<IdRow<Chunk>>, CubeError> {
         self.store.get_chunks_out_of_queue(ids).await
     }
     async fn get_partitions_out_of_queue(
@@ -981,7 +987,9 @@ impl MetaStore for RaftMetaStore {
     async fn get_all_partitions_and_chunks_out_of_queue(
         &self,
     ) -> Result<(Vec<IdRow<Partition>>, Vec<IdRow<Chunk>>), CubeError> {
-        self.store.get_all_partitions_and_chunks_out_of_queue().await
+        self.store
+            .get_all_partitions_and_chunks_out_of_queue()
+            .await
     }
     async fn get_chunks_by_partition_out_of_queue(
         &self,
@@ -1120,11 +1128,7 @@ impl MetaStore for RaftMetaStore {
     // -------------------------------------------------------------------
     // WAL
     // -------------------------------------------------------------------
-    async fn create_wal(
-        &self,
-        table_id: u64,
-        row_count: usize,
-    ) -> Result<IdRow<WAL>, CubeError> {
+    async fn create_wal(&self, table_id: u64, row_count: usize) -> Result<IdRow<WAL>, CubeError> {
         self.raft
             .propose(MetaCommand::CreateWal {
                 table_id,
@@ -1213,11 +1217,7 @@ impl MetaStore for RaftMetaStore {
             .into_optional_id_row(IdRowKind::Job)
             .map_err(|e| Self::mismatch("start_processing_job", e))
     }
-    async fn update_status(
-        &self,
-        job_id: u64,
-        status: JobStatus,
-    ) -> Result<IdRow<Job>, CubeError> {
+    async fn update_status(&self, job_id: u64, status: JobStatus) -> Result<IdRow<Job>, CubeError> {
         let status_blob = Self::encode_blob("update_status", "status", &status)?;
         // M3.4.c: leader-stamped now for `Job::last_heart_beat`.
         let assigned_now_millis = Utc::now().timestamp_millis();
@@ -1368,8 +1368,11 @@ impl MetaStore for RaftMetaStore {
         old_ids: Vec<u64>,
         new_seq_pointer: Option<Vec<Option<SeqPointer>>>,
     ) -> Result<Option<IdRow<ReplayHandle>>, CubeError> {
-        let new_seq_pointer_blob =
-            Self::encode_blob("replace_replay_handles", "new_seq_pointer", &new_seq_pointer)?;
+        let new_seq_pointer_blob = Self::encode_blob(
+            "replace_replay_handles",
+            "new_seq_pointer",
+            &new_seq_pointer,
+        )?;
         self.raft
             .propose(MetaCommand::ReplaceReplayHandles {
                 old_ids,
@@ -1489,21 +1492,24 @@ mod tests {
             .expect("create_schema");
         assert_eq!(created.get_row().get_name(), "public");
 
-        let listed = MetaStore::get_schemas(&*wrapper).await.expect("get_schemas");
+        let listed = MetaStore::get_schemas(&*wrapper)
+            .await
+            .expect("get_schemas");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].get_id(), created.get_id());
 
-        let renamed =
-            MetaStore::rename_schema(&*wrapper, "public".into(), "renamed".into())
-                .await
-                .expect("rename_schema");
+        let renamed = MetaStore::rename_schema(&*wrapper, "public".into(), "renamed".into())
+            .await
+            .expect("rename_schema");
         assert_eq!(renamed.get_row().get_name(), "renamed");
 
         MetaStore::delete_schema(&*wrapper, "renamed".into())
             .await
             .expect("delete_schema");
 
-        let after = MetaStore::get_schemas(&*wrapper).await.expect("get_schemas");
+        let after = MetaStore::get_schemas(&*wrapper)
+            .await
+            .expect("get_schemas");
         assert!(after.is_empty(), "schema must be gone after delete");
 
         cleanup(&sp, &rp);
@@ -1531,9 +1537,7 @@ mod tests {
             JobType::PartitionCompaction,
             "node1".to_string(),
         );
-        let added = MetaStore::add_job(&*wrapper, job)
-            .await
-            .expect("add_job");
+        let added = MetaStore::add_job(&*wrapper, job).await.expect("add_job");
         let added = added.expect("add_job must produce a row");
         let job_id = added.get_id();
 
@@ -1560,9 +1564,7 @@ mod tests {
         assert_eq!(deleted.get_id(), job_id);
 
         // all_jobs — empty after delete.
-        let remaining = MetaStore::all_jobs(&*wrapper)
-            .await
-            .expect("all_jobs");
+        let remaining = MetaStore::all_jobs(&*wrapper).await.expect("all_jobs");
         assert!(remaining.is_empty(), "queue must be empty after delete");
 
         cleanup(&sp, &rp);
@@ -1580,8 +1582,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn trigger_snapshot_persists_metadata_and_data() {
-        let (wrapper, sp, rp, raft_dir) =
-            setup_wrapper("raft_trigger_snapshot_smoke");
+        let (wrapper, sp, rp, raft_dir) = setup_wrapper("raft_trigger_snapshot_smoke");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Plant some state through the trait so the snapshot has
@@ -1672,8 +1673,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn trigger_snapshot_uploads_to_remote_fs() {
-        let (wrapper, sp, rp, raft_dir) =
-            setup_wrapper("raft_trigger_snapshot_remote_upload");
+        let (wrapper, sp, rp, raft_dir) = setup_wrapper("raft_trigger_snapshot_remote_upload");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         wrapper
@@ -1718,8 +1718,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn trigger_snapshot_compacts_log_past_keep_past() {
-        let (wrapper, sp, rp, raft_dir) =
-            setup_wrapper("raft_trigger_snapshot_compaction");
+        let (wrapper, sp, rp, raft_dir) = setup_wrapper("raft_trigger_snapshot_compaction");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Drive enough writes that snapshot.index is well above
@@ -1734,10 +1733,8 @@ mod tests {
 
         use raft::Storage;
         let storage = wrapper.raft.storage();
-        let pre_first =
-            Storage::first_index(&storage).expect("pre first_index");
-        let pre_last =
-            Storage::last_index(&storage).expect("pre last_index");
+        let pre_first = Storage::first_index(&storage).expect("pre first_index");
+        let pre_last = Storage::last_index(&storage).expect("pre last_index");
         assert!(
             pre_last - pre_first >= 9,
             "test wants ≥10 entries; pre log has {}..={}",
@@ -1751,10 +1748,8 @@ mod tests {
             .await
             .expect("trigger_snapshot");
 
-        let post_first =
-            Storage::first_index(&storage).expect("post first_index");
-        let post_last =
-            Storage::last_index(&storage).expect("post last_index");
+        let post_first = Storage::first_index(&storage).expect("post first_index");
+        let post_last = Storage::last_index(&storage).expect("post last_index");
 
         // last_index unchanged — compaction removes prefix only.
         assert_eq!(post_last, pre_last, "compaction must not touch tail");

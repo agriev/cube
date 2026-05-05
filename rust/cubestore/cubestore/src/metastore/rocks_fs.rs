@@ -69,8 +69,7 @@ pub trait MetaStoreFs: Send + Sync {
         _remote_name: String,
     ) -> Result<u64, CubeError> {
         Err(CubeError::internal(
-            "upload_raft_snapshot_file not supported by this MetaStoreFs"
-                .to_string(),
+            "upload_raft_snapshot_file not supported by this MetaStoreFs".to_string(),
         ))
     }
 }
@@ -652,10 +651,7 @@ impl MetaStoreFs for BaseRocksStoreFs {
 
         let remote_path = format!("raft-snapshots/{}", remote_name);
         self.remote_fs
-            .upload_file(
-                staging_path.to_str().unwrap().to_string(),
-                remote_path,
-            )
+            .upload_file(staging_path.to_str().unwrap().to_string(), remote_path)
             .await
     }
 }

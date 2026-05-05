@@ -48,9 +48,9 @@ use crate::metastore::table::StreamOffset;
 use crate::metastore::{
     Chunk, Column, IdRow, ImportFormat, IndexDef, MetaStore, Partition, RocksMetaStore,
 };
-use chrono::{DateTime, TimeZone, Utc};
 use crate::raft::command::{IdRowKind, MetaCommand, MetaCommandResult};
 use crate::raft::state_machine::Apply;
+use chrono::{DateTime, TimeZone, Utc};
 // Row is imported inside the SwapActivePartitions arm where it's used.
 use crate::CubeError;
 use async_trait::async_trait;
@@ -247,11 +247,7 @@ impl Apply for RocksMetaStoreApply {
                 let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
                 let row = self
                     .store
-                    .create_replay_handle_from_seq_pointers_with_now(
-                        table_id,
-                        seq_pointers,
-                        now,
-                    )
+                    .create_replay_handle_from_seq_pointers_with_now(table_id, seq_pointers, now)
                     .await?;
                 wrap_id_row(IdRowKind::ReplayHandle, &row)
             }
@@ -367,10 +363,8 @@ impl Apply for RocksMetaStoreApply {
                 chunk_ids,
                 last_inserted_at_millis,
             } => {
-                let last_inserted_at = decode_optional_millis(
-                    last_inserted_at_millis,
-                    "last_inserted_at_millis",
-                )?;
+                let last_inserted_at =
+                    decode_optional_millis(last_inserted_at_millis, "last_inserted_at_millis")?;
                 self.store
                     .chunk_update_last_inserted(chunk_ids, last_inserted_at)
                     .await?;
@@ -410,9 +404,8 @@ impl Apply for RocksMetaStoreApply {
             MetaCommand::AddJob { job_blob } => {
                 let job: Job = decode_typed_blob(&job_blob, "job_blob")?;
                 let opt = self.store.add_job(job).await?;
-                MetaCommandResult::optional_id_row(IdRowKind::Job, opt.as_ref()).map_err(|e| {
-                    CubeError::internal(format!("encode AddJob result: {}", e))
-                })
+                MetaCommandResult::optional_id_row(IdRowKind::Job, opt.as_ref())
+                    .map_err(|e| CubeError::internal(format!("encode AddJob result: {}", e)))
             }
             MetaCommand::StartProcessingJob {
                 server_name,
@@ -463,12 +456,7 @@ impl Apply for RocksMetaStoreApply {
                     decode_typed_blob(&new_seq_pointer_blob, "new_seq_pointer_blob")?;
                 let opt = self.store.replace_replay_handles(old_ids, new_seq).await?;
                 MetaCommandResult::optional_id_row(IdRowKind::ReplayHandle, opt.as_ref()).map_err(
-                    |e| {
-                        CubeError::internal(format!(
-                            "encode ReplaceReplayHandles result: {}",
-                            e
-                        ))
-                    },
+                    |e| CubeError::internal(format!("encode ReplaceReplayHandles result: {}", e)),
                 )
             }
 
@@ -480,8 +468,7 @@ impl Apply for RocksMetaStoreApply {
                 // Re-join the split u128. flexbuffers doesn't have native
                 // u128 so M3.1 split it; here we re-form before calling
                 // the trait method.
-                let snapshot_id =
-                    (snapshot_id_high as u128) << 64 | snapshot_id_low as u128;
+                let snapshot_id = (snapshot_id_high as u128) << 64 | snapshot_id_low as u128;
                 self.store.set_current_snapshot(snapshot_id).await?;
                 Ok(MetaCommandResult::Unit)
             }
@@ -512,23 +499,15 @@ impl Apply for RocksMetaStoreApply {
                 assigned_now_millis,
             } => {
                 let columns: Vec<Column> = decode_typed_blob(&columns_blob, "columns_blob")?;
-                let import_format: Option<ImportFormat> = decode_optional_blob(
-                    import_format_blob.as_deref(),
-                    "import_format_blob",
-                )?;
+                let import_format: Option<ImportFormat> =
+                    decode_optional_blob(import_format_blob.as_deref(), "import_format_blob")?;
                 let indexes: Vec<IndexDef> = decode_typed_blob(&indexes_blob, "indexes_blob")?;
-                let source_columns: Option<Vec<Column>> = decode_optional_blob(
-                    source_columns_blob.as_deref(),
-                    "source_columns_blob",
-                )?;
-                let stream_offset: Option<StreamOffset> = decode_optional_blob(
-                    stream_offset_blob.as_deref(),
-                    "stream_offset_blob",
-                )?;
-                let build_range_end = decode_optional_millis(
-                    build_range_end_millis,
-                    "build_range_end_millis",
-                )?;
+                let source_columns: Option<Vec<Column>> =
+                    decode_optional_blob(source_columns_blob.as_deref(), "source_columns_blob")?;
+                let stream_offset: Option<StreamOffset> =
+                    decode_optional_blob(stream_offset_blob.as_deref(), "stream_offset_blob")?;
+                let build_range_end =
+                    decode_optional_millis(build_range_end_millis, "build_range_end_millis")?;
                 let seal_at = decode_optional_millis(seal_at_millis, "seal_at_millis")?;
                 let now = decode_required_millis(assigned_now_millis, "assigned_now_millis")?;
                 let row = self
@@ -670,10 +649,7 @@ fn wrap_id_row<T: serde::Serialize>(
     row: &T,
 ) -> Result<MetaCommandResult, CubeError> {
     MetaCommandResult::id_row(kind, row).map_err(|e| {
-        CubeError::internal(format!(
-            "encode IdRow<{:?}> for apply result: {}",
-            kind, e
-        ))
+        CubeError::internal(format!("encode IdRow<{:?}> for apply result: {}", kind, e))
     })
 }
 
@@ -698,10 +674,7 @@ fn decode_flex<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
 /// already wrapped in the format `Apply` callers expect.
 fn decode_typed_blob<T: DeserializeOwned>(bytes: &[u8], field: &str) -> Result<T, CubeError> {
     decode_flex(bytes).map_err(|e| {
-        CubeError::internal(format!(
-            "MetaCommand apply: {} decode failed: {}",
-            field, e
-        ))
+        CubeError::internal(format!("MetaCommand apply: {} decode failed: {}", field, e))
     })
 }
 
@@ -787,8 +760,7 @@ mod tests {
             .join(format!("{}-remote", test_name));
         let _ = fs::remove_dir_all(&store_path);
         let _ = fs::remove_dir_all(&remote_store_path);
-        let remote_fs =
-            LocalDirRemoteFs::new(Some(remote_store_path.clone()), store_path.clone());
+        let remote_fs = LocalDirRemoteFs::new(Some(remote_store_path.clone()), store_path.clone());
         let store = RocksMetaStore::new(
             store_path.join("metastore").as_path(),
             BaseRocksStoreFs::new_for_metastore(remote_fs.clone(), config.config_obj()),
@@ -970,8 +942,7 @@ mod tests {
         // snapshots, so it will error — but the error message
         // contains the rejoined id, so we use that as the wire
         // round-trip assertion.
-        let original: u128 =
-            ((0x1234_5678_9ABC_DEF0u128) << 64) | 0xDEAD_BEEF_CAFE_BABEu128;
+        let original: u128 = ((0x1234_5678_9ABC_DEF0u128) << 64) | 0xDEAD_BEEF_CAFE_BABEu128;
         let snapshot_id_low = original as u64;
         let snapshot_id_high = (original >> 64) as u64;
 

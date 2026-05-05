@@ -778,7 +778,10 @@ mod tests {
             source_columns_blob: Some(vec![0xF3; 16]),
             stream_offset_blob: Some(vec![0xF4; 4]),
             unique_key_column_names: Some(vec!["id".into(), "ts".into()]),
-            aggregates: Some(vec![("count".into(), "*".into()), ("sum".into(), "amt".into())]),
+            aggregates: Some(vec![
+                ("count".into(), "*".into()),
+                ("sum".into(), "amt".into()),
+            ]),
             partition_split_threshold: Some(1 << 30),
             trace_obj: Some("trace-blob".into()),
             drop_if_exists: false,
@@ -1069,7 +1072,9 @@ mod tests {
         round_trip(MetaCommand::InsertChunks {
             chunks_blob: vec![0xCC; 256],
         });
-        round_trip(MetaCommand::InsertChunks { chunks_blob: vec![] });
+        round_trip(MetaCommand::InsertChunks {
+            chunks_blob: vec![],
+        });
 
         round_trip(MetaCommand::DeleteAllJobs);
 
@@ -1328,7 +1333,9 @@ mod tests {
         // Build an IdRow tagged Schema, ask for it as Table — must error.
         let row = (1u64, "name".to_string());
         let r = MetaCommandResult::id_row(IdRowKind::Schema, &row).expect("build");
-        let err = r.into_id_row::<(u64, String)>(IdRowKind::Table).unwrap_err();
+        let err = r
+            .into_id_row::<(u64, String)>(IdRowKind::Table)
+            .unwrap_err();
         match err {
             MetaCommandResultMismatch::Variant { expected, got } => {
                 assert!(expected.contains("Table"), "expected msg: {}", expected);

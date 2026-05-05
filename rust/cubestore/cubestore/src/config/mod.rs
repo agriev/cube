@@ -616,10 +616,7 @@ impl HaPeer {
             .parse()
             .map_err(|_| format!("peer id is not a u64: {:?}", id_str))?;
         if id == 0 {
-            return Err(format!(
-                "peer id 0 is reserved by raft-rs, got {:?}",
-                spec
-            ));
+            return Err(format!("peer id 0 is reserved by raft-rs, got {:?}", spec));
         }
         let (host, port_str) = host_port
             .rsplit_once(':')
@@ -2394,9 +2391,7 @@ impl Config {
                             async move |i| {
                                 let config = i.get_service_typed::<dyn ConfigObj>().await;
                                 let metastore_fs = i.get_service("metastore_fs").await;
-                                let meta_store = if let Some(dump_dir) =
-                                    config.clone().dump_dir()
-                                {
+                                let meta_store = if let Some(dump_dir) = config.clone().dump_dir() {
                                     RocksMetaStore::load_from_dump(
                                         &Path::new(&path),
                                         dump_dir,
@@ -2406,11 +2401,9 @@ impl Config {
                                     .await
                                     .unwrap()
                                 } else {
-                                    RocksMetaStore::load_from_remote(
-                                        &path, metastore_fs, config,
-                                    )
-                                    .await
-                                    .unwrap()
+                                    RocksMetaStore::load_from_remote(&path, metastore_fs, config)
+                                        .await
+                                        .unwrap()
                                 };
                                 meta_store.add_listener(metastore_event_sender).await;
                                 meta_store
@@ -2441,32 +2434,26 @@ impl Config {
                     let _ = metastore_event_sender_to_move;
                     let event_sender = metastore_event_sender;
                     self.injector
-                        .register_typed::<RocksMetaStore, RocksMetaStore, _, _>(
-                            async move |i| {
-                                let config = i.get_service_typed::<dyn ConfigObj>().await;
-                                let metastore_fs = i.get_service("metastore_fs").await;
-                                let meta_store = if let Some(dump_dir) =
-                                    config.clone().dump_dir()
-                                {
-                                    RocksMetaStore::load_from_dump(
-                                        &Path::new(&path),
-                                        dump_dir,
-                                        metastore_fs,
-                                        config,
-                                    )
+                        .register_typed::<RocksMetaStore, RocksMetaStore, _, _>(async move |i| {
+                            let config = i.get_service_typed::<dyn ConfigObj>().await;
+                            let metastore_fs = i.get_service("metastore_fs").await;
+                            let meta_store = if let Some(dump_dir) = config.clone().dump_dir() {
+                                RocksMetaStore::load_from_dump(
+                                    &Path::new(&path),
+                                    dump_dir,
+                                    metastore_fs,
+                                    config,
+                                )
+                                .await
+                                .unwrap()
+                            } else {
+                                RocksMetaStore::load_from_remote(&path, metastore_fs, config)
                                     .await
                                     .unwrap()
-                                } else {
-                                    RocksMetaStore::load_from_remote(
-                                        &path, metastore_fs, config,
-                                    )
-                                    .await
-                                    .unwrap()
-                                };
-                                meta_store.add_listener(event_sender).await;
-                                meta_store
-                            },
-                        )
+                            };
+                            meta_store.add_listener(event_sender).await;
+                            meta_store
+                        })
                         .await;
 
                     let ha_raft_peers = self.config_obj.ha_raft_peers();
@@ -2999,9 +2986,8 @@ mod ha_peer_tests {
     #[test]
     fn parses_dotted_kubernetes_hostname() {
         // StatefulSet headless DNS: <pod>.<service>.<ns>.svc.cluster.local
-        let p =
-            HaPeer::parse("2@cubestore-router-1.cubestore-router.cube.svc.cluster.local:9100")
-                .unwrap();
+        let p = HaPeer::parse("2@cubestore-router-1.cubestore-router.cube.svc.cluster.local:9100")
+            .unwrap();
         assert_eq!(p.id, 2);
         assert_eq!(
             p.host,
@@ -3012,10 +2998,7 @@ mod ha_peer_tests {
 
     #[test]
     fn parses_three_node_list() {
-        let peers = HaPeer::parse_list(
-            "1@router-0:9100,2@router-1:9100,3@router-2:9100",
-        )
-        .unwrap();
+        let peers = HaPeer::parse_list("1@router-0:9100,2@router-1:9100,3@router-2:9100").unwrap();
         assert_eq!(peers.len(), 3);
         assert_eq!(peers[0].id, 1);
         assert_eq!(peers[2].host, "router-2");

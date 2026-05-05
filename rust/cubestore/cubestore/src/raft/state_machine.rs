@@ -174,7 +174,14 @@ impl RaftNode {
         // and an inbound the test never feeds.
         let transport = Arc::new(NoopTransport);
         let (_inbound, inbound_rx) = Inbound::new();
-        Self::start_inner(node_id, storage, apply, transport, inbound_rx, ClusterKind::Single)
+        Self::start_inner(
+            node_id,
+            storage,
+            apply,
+            transport,
+            inbound_rx,
+            ClusterKind::Single,
+        )
     }
 
     /// Boot a multi-node Raft replica. The caller supplies:
@@ -206,7 +213,14 @@ impl RaftNode {
     ) -> Result<Self, RaftError> {
         let storage_inner = RaftStorage::open(data_dir, voters)?;
         let storage = SharedRaftStorage::new(Arc::new(storage_inner));
-        Self::start_inner(node_id, storage, apply, transport, inbound_rx, ClusterKind::Multi)
+        Self::start_inner(
+            node_id,
+            storage,
+            apply,
+            transport,
+            inbound_rx,
+            ClusterKind::Multi,
+        )
     }
 
     /// Test-only entry point: open storage with an explicit voter
@@ -220,7 +234,14 @@ impl RaftNode {
         transport: Arc<T>,
         inbound_rx: mpsc::UnboundedReceiver<Message>,
     ) -> Result<Self, RaftError> {
-        Self::start_inner(node_id, storage, apply, transport, inbound_rx, ClusterKind::Multi)
+        Self::start_inner(
+            node_id,
+            storage,
+            apply,
+            transport,
+            inbound_rx,
+            ClusterKind::Multi,
+        )
     }
 
     fn start_inner<A: Apply, T: Transport>(
@@ -248,7 +269,10 @@ impl RaftNode {
         let raw = RawNode::new(&cfg, storage.clone(), &logger)?;
 
         let (tx, rx) = mpsc::unbounded_channel::<Proposal>();
-        let pending = std::collections::HashMap::<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>::new();
+        let pending = std::collections::HashMap::<
+            u64,
+            oneshot::Sender<Result<MetaCommandResult, CubeError>>,
+        >::new();
 
         // Use Arc<dyn Transport> so the run_node task doesn't carry a
         // generic parameter (tokio::spawn captures must be 'static and
@@ -264,9 +288,7 @@ impl RaftNode {
         // M6.1 — leader-id atomic shared between the raft tick loop
         // and the public RaftNode handle. Updated inside the loop on
         // every state change.
-        let current_leader_id = std::sync::Arc::new(
-            std::sync::atomic::AtomicU64::new(0),
-        );
+        let current_leader_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let leader_id_for_loop = current_leader_id.clone();
 
         tokio::spawn(run_node(
@@ -299,8 +321,9 @@ impl RaftNode {
                 respond_to: tx,
             })
             .map_err(|_| CubeError::internal("raft task is not running".to_string()))?;
-        rx.await
-            .map_err(|_| CubeError::internal("raft task dropped the response channel".to_string()))?
+        rx.await.map_err(|_| {
+            CubeError::internal("raft task dropped the response channel".to_string())
+        })?
     }
 
     /// M5.4 — handle to the underlying storage so the snapshot
@@ -314,7 +337,9 @@ impl RaftNode {
     /// `None` means "no leader" (raft-rs returns 0 in that case);
     /// `Some(id)` is the id of the current leader (could be self).
     pub fn current_leader_id(&self) -> Option<u64> {
-        let v = self.current_leader_id.load(std::sync::atomic::Ordering::Relaxed);
+        let v = self
+            .current_leader_id
+            .load(std::sync::atomic::Ordering::Relaxed);
         if v == 0 {
             None
         } else {
@@ -355,7 +380,10 @@ async fn run_node<A: Apply>(
     storage: SharedRaftStorage,
     mut proposals: mpsc::UnboundedReceiver<Proposal>,
     apply: Arc<A>,
-    mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
+    mut pending: std::collections::HashMap<
+        u64,
+        oneshot::Sender<Result<MetaCommandResult, CubeError>>,
+    >,
     logger: slog::Logger,
     transport: Arc<dyn Transport>,
     mut inbound: mpsc::UnboundedReceiver<Message>,
@@ -487,7 +515,10 @@ async fn drive_ready<A: Apply>(
     raw: &mut RawNode<SharedRaftStorage>,
     storage: &SharedRaftStorage,
     apply: &Arc<A>,
-    pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
+    pending: &mut std::collections::HashMap<
+        u64,
+        oneshot::Sender<Result<MetaCommandResult, CubeError>>,
+    >,
     transport: &Arc<dyn Transport>,
 ) {
     if !raw.has_ready() {
@@ -515,10 +546,7 @@ async fn drive_ready<A: Apply>(
         let snap_index = snap.get_metadata().index;
         match storage.apply_snapshot(snap) {
             Ok(()) => {
-                log::info!(
-                    "raft: applied inbound snapshot at index {}",
-                    snap_index
-                );
+                log::info!("raft: applied inbound snapshot at index {}", snap_index);
             }
             Err(e) => {
                 // A failed snapshot install leaves the storage in
@@ -598,7 +626,10 @@ async fn drive_ready<A: Apply>(
 async fn apply_committed<A: Apply>(
     entries: &[Entry],
     apply: &Arc<A>,
-    pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<MetaCommandResult, CubeError>>>,
+    pending: &mut std::collections::HashMap<
+        u64,
+        oneshot::Sender<Result<MetaCommandResult, CubeError>>,
+    >,
 ) -> Option<u64> {
     let mut highest = None;
     for ent in entries {
@@ -1038,9 +1069,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn raft_dispatches_create_schema_to_rocks_meta_store() {
         use crate::config::Config;
-        use crate::metastore::{
-            BaseRocksStoreFs, IdRow, MetaStore, RocksMetaStore, Schema,
-        };
+        use crate::metastore::{BaseRocksStoreFs, IdRow, MetaStore, RocksMetaStore, Schema};
         use crate::raft::command::IdRowKind;
         use crate::raft::rocks_apply::RocksMetaStoreApply;
         use crate::remotefs::LocalDirRemoteFs;
@@ -1056,8 +1085,7 @@ mod tests {
         let raft_dir = TempDir::new().unwrap();
 
         let config = Config::test(test_name);
-        let remote_fs =
-            LocalDirRemoteFs::new(Some(remote_store_path.clone()), store_path.clone());
+        let remote_fs = LocalDirRemoteFs::new(Some(remote_store_path.clone()), store_path.clone());
         let rocks = RocksMetaStore::new(
             store_path.join("metastore").as_path(),
             BaseRocksStoreFs::new_for_metastore(remote_fs.clone(), config.config_obj()),
@@ -1065,8 +1093,8 @@ mod tests {
         )
         .expect("RocksMetaStore::new");
         let apply = Arc::new(RocksMetaStoreApply::new(rocks.clone()));
-        let raft = RaftNode::start_single_node(raft_dir.path(), 1, apply)
-            .expect("boot single-node raft");
+        let raft =
+            RaftNode::start_single_node(raft_dir.path(), 1, apply).expect("boot single-node raft");
 
         // Settle election.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1114,9 +1142,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn deterministic_replay_two_instance_equivalence() {
         use crate::config::Config;
-        use crate::metastore::{
-            BaseRocksStoreFs, IdRow, MetaStore, RocksMetaStore, Schema,
-        };
+        use crate::metastore::{BaseRocksStoreFs, IdRow, MetaStore, RocksMetaStore, Schema};
         use crate::raft::raft_meta_store::RaftMetaStore;
         use crate::remotefs::LocalDirRemoteFs;
         use std::env;
@@ -1124,7 +1150,12 @@ mod tests {
 
         async fn boot(
             test_name: &str,
-        ) -> (Arc<RaftMetaStore>, std::path::PathBuf, std::path::PathBuf, TempDir) {
+        ) -> (
+            Arc<RaftMetaStore>,
+            std::path::PathBuf,
+            std::path::PathBuf,
+            TempDir,
+        ) {
             let cwd = env::current_dir().unwrap();
             let store_path = cwd.join(format!("{}-local", test_name));
             let remote_path = cwd.join(format!("{}-remote", test_name));
@@ -1152,14 +1183,12 @@ mod tests {
 
         // Issue the same sequence of writes through both wrappers.
         for schema in &["alpha", "beta", "gamma"] {
-            let _: IdRow<Schema> =
-                MetaStore::create_schema(&*a, (*schema).into(), false)
-                    .await
-                    .expect("create_schema on a");
-            let _: IdRow<Schema> =
-                MetaStore::create_schema(&*b, (*schema).into(), false)
-                    .await
-                    .expect("create_schema on b");
+            let _: IdRow<Schema> = MetaStore::create_schema(&*a, (*schema).into(), false)
+                .await
+                .expect("create_schema on a");
+            let _: IdRow<Schema> = MetaStore::create_schema(&*b, (*schema).into(), false)
+                .await
+                .expect("create_schema on b");
         }
 
         // Settle apply (single-node Raft applies inline before
@@ -1219,11 +1248,9 @@ mod tests {
         let start = std::time::Instant::now();
         loop {
             for n in nodes {
-                let res = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    n.1.propose(probe.clone()),
-                )
-                .await;
+                let res =
+                    tokio::time::timeout(Duration::from_millis(100), n.1.propose(probe.clone()))
+                        .await;
                 if let Ok(Ok(_)) = res {
                     return n;
                 }
@@ -1323,14 +1350,8 @@ mod tests {
                 3 => apply3.snapshot(),
                 _ => unreachable!(),
             };
-            let after = recorded
-                .iter()
-                .filter(|c| **c == cmd)
-                .count();
-            let probes = recorded
-                .iter()
-                .filter(|c| **c == probe)
-                .count();
+            let after = recorded.iter().filter(|c| **c == cmd).count();
+            let probes = recorded.iter().filter(|c| **c == probe).count();
             assert_eq!(
                 after, 1,
                 "replica {} must apply the post-election write exactly once (saw {})",
@@ -1339,7 +1360,8 @@ mod tests {
             assert!(
                 probes >= 1,
                 "replica {} must apply at least one leader-probe command (saw {})",
-                id, probes
+                id,
+                probes
             );
         }
 
@@ -1383,17 +1405,32 @@ mod tests {
         let apply3 = Arc::new(RecordingApply::new());
 
         let n1 = RaftNode::start_multi_node(
-            dir1.path(), 1, vec![1, 2, 3],
-            Arc::clone(&apply1), Arc::clone(&transport), rx1,
-        ).expect("start n1");
+            dir1.path(),
+            1,
+            vec![1, 2, 3],
+            Arc::clone(&apply1),
+            Arc::clone(&transport),
+            rx1,
+        )
+        .expect("start n1");
         let n2 = RaftNode::start_multi_node(
-            dir2.path(), 2, vec![1, 2, 3],
-            Arc::clone(&apply2), Arc::clone(&transport), rx2,
-        ).expect("start n2");
+            dir2.path(),
+            2,
+            vec![1, 2, 3],
+            Arc::clone(&apply2),
+            Arc::clone(&transport),
+            rx2,
+        )
+        .expect("start n2");
         let n3 = RaftNode::start_multi_node(
-            dir3.path(), 3, vec![1, 2, 3],
-            Arc::clone(&apply3), Arc::clone(&transport), rx3,
-        ).expect("start n3");
+            dir3.path(),
+            3,
+            vec![1, 2, 3],
+            Arc::clone(&apply3),
+            Arc::clone(&transport),
+            rx3,
+        )
+        .expect("start n3");
 
         let nodes = vec![(1u64, n1), (2u64, n2), (3u64, n3)];
         let first_leader = await_leader(&nodes, Duration::from_secs(15)).await;
@@ -1410,14 +1447,10 @@ mod tests {
         // Find the new leader among the survivors. With election_tick
         // = 10 and heartbeat = 3 ticks (50ms each), elections converge
         // in roughly 1-2 rounds = ~750ms-1.5s. Give 10s for safety.
-        let survivors: Vec<&(u64, RaftNode)> = nodes
-            .iter()
-            .filter(|(id, _)| *id != killed_id)
-            .collect();
-        let owned: Vec<(u64, RaftNode)> = survivors
-            .iter()
-            .map(|(id, n)| (*id, n.clone()))
-            .collect();
+        let survivors: Vec<&(u64, RaftNode)> =
+            nodes.iter().filter(|(id, _)| *id != killed_id).collect();
+        let owned: Vec<(u64, RaftNode)> =
+            survivors.iter().map(|(id, n)| (*id, n.clone())).collect();
         let new_leader = await_leader(&owned, Duration::from_secs(10)).await;
         assert_ne!(
             new_leader.0, killed_id,
@@ -1481,17 +1514,32 @@ mod tests {
         let apply3 = Arc::new(RecordingApply::new());
 
         let n1 = RaftNode::start_multi_node(
-            dir1.path(), 1, vec![1, 2, 3],
-            Arc::clone(&apply1), Arc::clone(&transport1), rx1,
-        ).expect("start n1");
+            dir1.path(),
+            1,
+            vec![1, 2, 3],
+            Arc::clone(&apply1),
+            Arc::clone(&transport1),
+            rx1,
+        )
+        .expect("start n1");
         let n2 = RaftNode::start_multi_node(
-            dir2.path(), 2, vec![1, 2, 3],
-            Arc::clone(&apply2), Arc::clone(&transport2), rx2,
-        ).expect("start n2");
+            dir2.path(),
+            2,
+            vec![1, 2, 3],
+            Arc::clone(&apply2),
+            Arc::clone(&transport2),
+            rx2,
+        )
+        .expect("start n2");
         let n3 = RaftNode::start_multi_node(
-            dir3.path(), 3, vec![1, 2, 3],
-            Arc::clone(&apply3), Arc::clone(&transport3), rx3,
-        ).expect("start n3");
+            dir3.path(),
+            3,
+            vec![1, 2, 3],
+            Arc::clone(&apply3),
+            Arc::clone(&transport3),
+            rx3,
+        )
+        .expect("start n3");
 
         let nodes = vec![(1u64, n1), (2u64, n2), (3u64, n3)];
         let leader = await_leader(&nodes, Duration::from_secs(20)).await;
@@ -1560,17 +1608,32 @@ mod tests {
         let apply3 = Arc::new(RecordingApply::new());
 
         let n1 = RaftNode::start_multi_node(
-            dir1.path(), 1, vec![1, 2, 3],
-            Arc::clone(&apply1), Arc::clone(&transport), rx1,
-        ).expect("start n1");
+            dir1.path(),
+            1,
+            vec![1, 2, 3],
+            Arc::clone(&apply1),
+            Arc::clone(&transport),
+            rx1,
+        )
+        .expect("start n1");
         let n2 = RaftNode::start_multi_node(
-            dir2.path(), 2, vec![1, 2, 3],
-            Arc::clone(&apply2), Arc::clone(&transport), rx2,
-        ).expect("start n2");
+            dir2.path(),
+            2,
+            vec![1, 2, 3],
+            Arc::clone(&apply2),
+            Arc::clone(&transport),
+            rx2,
+        )
+        .expect("start n2");
         let n3 = RaftNode::start_multi_node(
-            dir3.path(), 3, vec![1, 2, 3],
-            Arc::clone(&apply3), Arc::clone(&transport), rx3,
-        ).expect("start n3");
+            dir3.path(),
+            3,
+            vec![1, 2, 3],
+            Arc::clone(&apply3),
+            Arc::clone(&transport),
+            rx3,
+        )
+        .expect("start n3");
 
         let nodes: Vec<(u64, RaftNode)> = vec![(1, n1), (2, n2), (3, n3)];
 
@@ -1637,7 +1700,11 @@ mod tests {
         assert!(
             c1 >= ROUNDS && c2 >= ROUNDS && c3 >= ROUNDS,
             "every replica should see at least {} applies after {} rounds; got {}/{}/{}",
-            ROUNDS, ROUNDS, c1, c2, c3
+            ROUNDS,
+            ROUNDS,
+            c1,
+            c2,
+            c3
         );
         // Convergence: replica counts must agree to within 2 per
         // round (one wasted probe per kill on average).
@@ -1646,7 +1713,10 @@ mod tests {
         assert!(
             max - min <= ROUNDS * 2,
             "replica apply counts diverged: {}/{}/{} (max-min={})",
-            c1, c2, c3, max - min
+            c1,
+            c2,
+            c3,
+            max - min
         );
     }
 
@@ -1702,17 +1772,32 @@ mod tests {
         let apply3 = Arc::new(RecordingApply::new());
 
         let n1 = RaftNode::start_multi_node(
-            dir1.path(), 1, vec![1, 2, 3],
-            Arc::clone(&apply1), Arc::clone(&transport), rx1,
-        ).expect("start n1");
+            dir1.path(),
+            1,
+            vec![1, 2, 3],
+            Arc::clone(&apply1),
+            Arc::clone(&transport),
+            rx1,
+        )
+        .expect("start n1");
         let n2 = RaftNode::start_multi_node(
-            dir2.path(), 2, vec![1, 2, 3],
-            Arc::clone(&apply2), Arc::clone(&transport), rx2,
-        ).expect("start n2");
+            dir2.path(),
+            2,
+            vec![1, 2, 3],
+            Arc::clone(&apply2),
+            Arc::clone(&transport),
+            rx2,
+        )
+        .expect("start n2");
         let n3 = RaftNode::start_multi_node(
-            dir3.path(), 3, vec![1, 2, 3],
-            Arc::clone(&apply3), Arc::clone(&transport), rx3,
-        ).expect("start n3");
+            dir3.path(),
+            3,
+            vec![1, 2, 3],
+            Arc::clone(&apply3),
+            Arc::clone(&transport),
+            rx3,
+        )
+        .expect("start n3");
 
         let nodes = vec![(1u64, n1), (2u64, n2), (3u64, n3)];
 
@@ -1740,10 +1825,7 @@ mod tests {
         // (~50 ms cadence); give a few ticks to settle.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let agreed_leader = loop {
-            let ids: Vec<Option<u64>> = nodes
-                .iter()
-                .map(|(_, n)| n.current_leader_id())
-                .collect();
+            let ids: Vec<Option<u64>> = nodes.iter().map(|(_, n)| n.current_leader_id()).collect();
             // All-Some-and-equal? Take it.
             if let Some(first) = ids[0] {
                 if ids.iter().all(|x| *x == Some(first)) {
@@ -1835,17 +1917,32 @@ mod tests {
         let apply3 = Arc::new(RecordingApply::new());
 
         let n1 = RaftNode::start_multi_node(
-            dir1.path(), 1, vec![1, 2, 3],
-            Arc::clone(&apply1), Arc::clone(&transport), rx1,
-        ).expect("start n1");
+            dir1.path(),
+            1,
+            vec![1, 2, 3],
+            Arc::clone(&apply1),
+            Arc::clone(&transport),
+            rx1,
+        )
+        .expect("start n1");
         let _n2 = RaftNode::start_multi_node(
-            dir2.path(), 2, vec![1, 2, 3],
-            Arc::clone(&apply2), Arc::clone(&transport), rx2,
-        ).expect("start n2");
+            dir2.path(),
+            2,
+            vec![1, 2, 3],
+            Arc::clone(&apply2),
+            Arc::clone(&transport),
+            rx2,
+        )
+        .expect("start n2");
         let _n3 = RaftNode::start_multi_node(
-            dir3.path(), 3, vec![1, 2, 3],
-            Arc::clone(&apply3), Arc::clone(&transport), rx3,
-        ).expect("start n3");
+            dir3.path(),
+            3,
+            vec![1, 2, 3],
+            Arc::clone(&apply3),
+            Arc::clone(&transport),
+            rx3,
+        )
+        .expect("start n3");
 
         // Give the nodes a moment to thrash on elections that won't
         // succeed — they'll all be Candidates with no quorum.
