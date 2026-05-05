@@ -32,22 +32,31 @@
 //! methods stay on local delegation despite their names — both
 //! use `read_operation` internally and are read-only.
 //!
-//! ## Determinism caveat (still unfixed)
+//! ## Determinism (M3.4 — closed)
 //!
-//! Write methods build row structs (`Table::new`, `Chunk::new`, etc.)
-//! that internally stamp `Utc::now()`. Today the wrapper proposes
-//! the bare args and the apply path on each replica builds its own
-//! struct with its own wall-clock — they will diverge.
+//! Every persistent write that carries a `DateTime<Utc>` field is
+//! leader-stamped:
 //!
-//! The audit (M3.4 audit, parked here): the only `Utc::now()` /
-//! `SystemTime::now()` sites in `metastore/mod.rs` are in **read**
-//! methods (filtering by elapsed time) — those are safe. The real
-//! gap is in row constructors (`Table::new` line ~230,
-//! `Chunk::new` line ~29 + ~30, `Job::new` line ~82 + ~107,
-//! `ReplayHandle::new` line ~119 + ~144, `Chunk::set_deactivated_at`
-//! line ~93). M3.4 lands the leader-stamp pattern that closes
-//! these. **Do not flip `CUBESTORE_HA_MODE=raft` (M3.5.c) until
-//! M3.4 is in.**
+//! - **M3.4.a** — `Chunk::new` and `Job::new` resolve `Utc::now()` once
+//!   on the caller, the row is serialized into a `*_blob` field on
+//!   the `MetaCommand`, and replicas insert the byte-identical bytes
+//!   on apply.
+//! - **M3.4.b** — `CreateTable` and `CreateReplayHandle*` ship the
+//!   leader's `assigned_now_millis` alongside the row args, and the
+//!   apply path calls `*_with_now` constructors (`Table::new_pure`,
+//!   `ReplayHandle::new_pure`) on each replica with that shared `now`.
+//! - **M3.4.c/d** — `DeactivateChunk*`, `UpdateHeartBeat`,
+//!   `UpdateStatus`, `StartProcessingJob` follow the same
+//!   `assigned_now_millis` → `*_with_now` pattern.
+//!
+//! Read-only filters in `metastore/mod.rs` (`not_ready_tables`,
+//! `get_orphaned_jobs`, `get_chunks_without_partition_created_seconds_ago`,
+//! …) intentionally use `Utc::now()` — they don't write back, so per-
+//! replica clock drift is harmless.
+//!
+//! Per-call-site classification: `docs/ha/M3.4-AUDIT.md`.
+//! Pure-replay regression test:
+//! `raft/rocks_apply.rs::tests::pure_replay_is_byte_deterministic_across_replicas`.
 
 use crate::metastore::job::{Job, JobStatus, JobType};
 use crate::metastore::multi_index::{MultiIndex, MultiPartition};
