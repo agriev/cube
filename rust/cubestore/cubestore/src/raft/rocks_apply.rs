@@ -15,16 +15,20 @@
 //! 3. Wraps the trait's return into the matching `MetaCommandResult`
 //!    variant via the helper constructors in `command.rs`.
 //!
-//! ## Determinism (read this before flipping `CUBESTORE_HA_MODE=raft`)
+//! ## Determinism (M3.4 — closed)
 //!
-//! Several existing `MetaStore` write methods read non-deterministic
-//! state (`Utc::now`, `next_id` derived from RocksDB merge counters).
-//! When this dispatch runs on multiple replicas, the replicas will
-//! diverge unless those reads happen on the leader and ship as part
-//! of the `MetaCommand` payload. M3.4 is the gating commit that adds
-//! `assigned_id: Option<u64>` / `assigned_now: Option<i64>` to the
-//! relevant variants and changes the trait methods to consume them.
-//! **Do not flip the HA boot path on (M3.5) until M3.4 is in.**
+//! Every persistent write that carries a `DateTime<Utc>` field is
+//! leader-stamped via `assigned_now_millis` on the propose side and
+//! decoded on the apply side via `decode_required_millis` /
+//! `decode_optional_millis`. The local `_with_now` helpers
+//! (`create_table_with_now`, `update_heart_beat_with_now`, …) thread
+//! the leader's `now` straight into the row constructor so all
+//! replicas produce a byte-identical RocksDB write.
+//!
+//! See `raft_meta_store.rs` for the per-method propose path,
+//! `docs/ha/M3.4-AUDIT.md` for the per-`Utc::now()` classification,
+//! and `tests::pure_replay_is_byte_deterministic_across_replicas`
+//! below for the regression test.
 //!
 //! ## Sub-milestones
 //!
@@ -962,5 +966,224 @@ mod tests {
         );
 
         cleanup(&sp, &rp);
+    }
+
+    // =====================================================================
+    // M3.4 determinism — pure-replay test
+    // =====================================================================
+    //
+    // Wire two independent RocksMetaStore replicas (A and B) and feed
+    // them the *same* MetaCommand sequence with the *same*
+    // `assigned_now_millis`. Then read the resulting rows back and
+    // assert their flexbuffer-encoded bytes are identical.
+    //
+    // The hypothesis under test: leader-stamped `now` survives the
+    // Raft wire format end-to-end, so two replicas applying the same
+    // log produce byte-identical persisted rows. Covers M3.4.a (job
+    // blob), M3.4.b.2 (CreateTable), M3.4.c (UpdateHeartBeat).
+    //
+    // If a future refactor reintroduces a per-replica `Utc::now()`
+    // call into any of these write paths, this test fires.
+    use crate::metastore::job::JobType;
+    use crate::metastore::ColumnType;
+    use crate::metastore::RowKey;
+    use crate::metastore::TableId;
+    use flexbuffers::FlexbufferSerializer;
+    use serde::Serialize;
+    // Note: chrono::{TimeZone, Utc} are already in scope via the
+    // module's `use chrono::{DateTime, TimeZone, Utc};` (rocks_apply.rs).
+    // `Column`, `IdRow`, `Job`, `JobStatus`, `IndexDef` come in via
+    // `use super::*;` at the top of `mod tests`.
+
+    /// Encode `value` as flexbuffer bytes — same shape `RaftMetaStore`
+    /// uses on the propose side.
+    fn flex_encode<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut s = FlexbufferSerializer::new();
+        value.serialize(&mut s).expect("flexbuffer encode");
+        s.take_buffer()
+    }
+
+    /// Compare two `IdRow<T>` rows by their flexbuffer-encoded bytes.
+    /// Stronger than `==` because it catches divergence in fields
+    /// `PartialEq` skips (none today, but defensive against future
+    /// `#[serde(skip)]` regressions).
+    fn assert_rows_byte_equal<T: Serialize + Clone>(
+        label: &str,
+        a: &IdRow<T>,
+        b: &IdRow<T>,
+    ) {
+        let ba = flex_encode(a);
+        let bb = flex_encode(b);
+        assert_eq!(
+            ba, bb,
+            "{}: replicas A and B diverge on persisted row bytes",
+            label
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_replay_is_byte_deterministic_across_replicas() {
+        let (store_a, sa_p, ra_p) = setup_store("m3_4_determinism_a");
+        let (store_b, sb_p, rb_p) = setup_store("m3_4_determinism_b");
+        let apply_a = RocksMetaStoreApply::new(store_a.clone());
+        let apply_b = RocksMetaStoreApply::new(store_b.clone());
+
+        // Leader-stamped "now" — single value shipped to both replicas.
+        // Picked to be far from any real wall clock so a stray
+        // `Utc::now()` regression would jump out by orders of magnitude.
+        let assigned_now_millis: i64 = 1_600_000_000_000;
+        let leader_now = Utc.timestamp_millis_opt(assigned_now_millis).single().unwrap();
+
+        // ---- 1. Schema ------------------------------------------------
+        // (no time field — but every table needs one)
+        for apply in [&apply_a, &apply_b] {
+            apply
+                .apply(MetaCommand::CreateSchema {
+                    schema_name: "det".into(),
+                    if_not_exists: false,
+                })
+                .await
+                .expect("CreateSchema");
+        }
+
+        // ---- 2. CreateTable (M3.4.b.2: Table::created_at) -------------
+        let columns = vec![Column::new("c1".into(), ColumnType::Int, 0)];
+        let columns_blob = flex_encode(&columns);
+        let indexes_blob = flex_encode(&Vec::<IndexDef>::new());
+
+        for apply in [&apply_a, &apply_b] {
+            apply
+                .apply(MetaCommand::CreateTable {
+                    schema_name: "det".into(),
+                    table_name: "t".into(),
+                    columns_blob: columns_blob.clone(),
+                    locations: None,
+                    import_format_blob: None,
+                    indexes_blob: indexes_blob.clone(),
+                    is_ready: true,
+                    build_range_end_millis: None,
+                    seal_at_millis: None,
+                    select_statement: None,
+                    source_columns_blob: None,
+                    stream_offset_blob: None,
+                    unique_key_column_names: None,
+                    aggregates: None,
+                    partition_split_threshold: None,
+                    trace_obj: None,
+                    drop_if_exists: false,
+                    extension: None,
+                    assigned_now_millis,
+                })
+                .await
+                .expect("CreateTable");
+        }
+
+        let table_a = store_a
+            .get_table("det".into(), "t".into())
+            .await
+            .expect("get_table A");
+        let table_b = store_b
+            .get_table("det".into(), "t".into())
+            .await
+            .expect("get_table B");
+        assert_eq!(
+            table_a.get_row().created_at(),
+            &Some(leader_now),
+            "Table::created_at must equal the leader-stamped now",
+        );
+        assert_rows_byte_equal("Table after CreateTable", &table_a, &table_b);
+
+        // ---- 3. AddJob (M3.4.a: job_blob ships full row) --------------
+        // Caller (scheduler) builds the Job once with its own now; we
+        // simulate that by constructing the Job locally and re-encoding.
+        // Both replicas receive identical bytes.
+        let mut job = Job::new(
+            RowKey::Table(TableId::Tables, table_a.get_id()),
+            JobType::TableImport,
+            "shard-0".into(),
+        );
+        // Stamp the leader-clock manually so the test doesn't depend on
+        // the host wall clock's nanosecond precision.
+        job = job.update_status_pure(
+            JobStatus::Scheduled("shard-0".into()),
+            leader_now,
+        );
+        let job_blob = flex_encode(&job);
+
+        for apply in [&apply_a, &apply_b] {
+            apply
+                .apply(MetaCommand::AddJob {
+                    job_blob: job_blob.clone(),
+                })
+                .await
+                .expect("AddJob");
+        }
+
+        let jobs_a = store_a.all_jobs().await.expect("all_jobs A");
+        let jobs_b = store_b.all_jobs().await.expect("all_jobs B");
+        assert_eq!(jobs_a.len(), 1);
+        assert_eq!(jobs_b.len(), 1);
+        assert_eq!(
+            jobs_a[0].get_row().last_heart_beat(),
+            &leader_now,
+            "Job::last_heart_beat must equal the leader-stamped now",
+        );
+        assert_rows_byte_equal("Job after AddJob", &jobs_a[0], &jobs_b[0]);
+
+        // ---- 4. UpdateHeartBeat (M3.4.c: Job::last_heart_beat) --------
+        let later_millis: i64 = assigned_now_millis + 5_000;
+        let later_now = Utc.timestamp_millis_opt(later_millis).single().unwrap();
+        let job_id = jobs_a[0].get_id();
+
+        for apply in [&apply_a, &apply_b] {
+            apply
+                .apply(MetaCommand::UpdateHeartBeat {
+                    job_id,
+                    assigned_now_millis: later_millis,
+                })
+                .await
+                .expect("UpdateHeartBeat");
+        }
+
+        let job_a = store_a.get_job(job_id).await.expect("get_job A");
+        let job_b = store_b.get_job(job_id).await.expect("get_job B");
+        assert_eq!(
+            job_a.get_row().last_heart_beat(),
+            &later_now,
+            "UpdateHeartBeat must use the leader-stamped later_now",
+        );
+        assert_rows_byte_equal("Job after UpdateHeartBeat", &job_a, &job_b);
+
+        // ---- 5. UpdateStatus (M3.4.c: Job::last_heart_beat) -----------
+        let final_millis: i64 = later_millis + 7_000;
+        let final_now = Utc.timestamp_millis_opt(final_millis).single().unwrap();
+        let status_blob = flex_encode(&JobStatus::Completed);
+
+        for apply in [&apply_a, &apply_b] {
+            apply
+                .apply(MetaCommand::UpdateStatus {
+                    job_id,
+                    status_blob: status_blob.clone(),
+                    assigned_now_millis: final_millis,
+                })
+                .await
+                .expect("UpdateStatus");
+        }
+
+        let job_a = store_a.get_job(job_id).await.expect("get_job A");
+        let job_b = store_b.get_job(job_id).await.expect("get_job B");
+        assert_eq!(
+            job_a.get_row().last_heart_beat(),
+            &final_now,
+            "UpdateStatus must use the leader-stamped final_now",
+        );
+        assert_rows_byte_equal("Job after UpdateStatus", &job_a, &job_b);
+
+        // Touch unused vars so the compiler doesn't strip them and so
+        // future readers see the leader_now intent.
+        let _ = (table_a, table_b);
+
+        cleanup(&sa_p, &ra_p);
+        cleanup(&sb_p, &rb_p);
     }
 }

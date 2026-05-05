@@ -660,10 +660,12 @@ impl HaPeer {
 /// `RaftMetaStore` wrapper (M3.5.c.2), routing every metastore write
 /// through Raft consensus before applying.
 ///
-/// **Do not flip to `Raft` until M3.4 has landed**, otherwise the
-/// non-deterministic `Utc::now()` calls in row constructors
-/// (`Table::new`, `Chunk::new`, `Job::new`, `ReplayHandle::new`)
-/// will diverge across replicas.
+/// Determinism (M3.4) is closed: every persistent write that carries
+/// a `DateTime<Utc>` field is leader-stamped via `assigned_now_millis`
+/// and applied via the matching `_with_now` helper. See
+/// `docs/ha/M3.4-AUDIT.md` for the per-call-site classification and
+/// `raft/rocks_apply.rs::tests::pure_replay_is_byte_deterministic_across_replicas`
+/// for the regression test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HaMode {
     /// Default; drop-in compatible with upstream cubestore.
@@ -2412,18 +2414,12 @@ impl Config {
                         .await;
                 }
                 HaMode::Raft => {
-                    // ⚠ Determinism caveat (M3.4): row constructors
-                    // (`Table::new`, `Chunk::new`, `Job::new`,
-                    // `ReplayHandle::new`) stamp `Utc::now()` at
-                    // apply time. Until M3.4 lands the leader-stamp
-                    // pattern, replicas will diverge — even though
-                    // M3.5.c.2 makes HA mode reachable, it is not
-                    // production-safe. Treat `CUBESTORE_HA_MODE=raft`
-                    // as a developer toggle until M3.4 is in.
-                    log::warn!(
-                        "CUBESTORE_HA_MODE=raft enabled — see docs/ha/M3-NOTES.md \
-                         for the M3.4 determinism caveat. Do not use in production \
-                         until M3.4 has landed."
+                    // M3.4 determinism is closed (leader-stamped now
+                    // for every persistent DateTime field; see
+                    // docs/ha/M3.4-AUDIT.md). Booting via the Raft
+                    // path is supported — info-level breadcrumb only.
+                    log::info!(
+                        "CUBESTORE_HA_MODE=raft enabled — booting RaftMetaStore"
                     );
 
                     // Use the pre-cloned sender for the Raft arm so
