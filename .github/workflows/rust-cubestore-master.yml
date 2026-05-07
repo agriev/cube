@@ -6,6 +6,9 @@ on:
       - 'rust/cubestore/**'
     branches:
       - master
+      # PR-S1: also gate ha-main so the HA fork's Cargo.lock drift is
+      # caught on every push, not just the next upstream merge.
+      - ha-main
 
 env:
   CARGO_INCREMENTAL: 0

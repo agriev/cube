@@ -1,4 +1,7 @@
-FROM cubejs/rust-builder:bookworm-llvm-18 AS builder
+# Base images are pinned by digest to defend against tag rewrite (PR-S1).
+# Refresh both via `make pin-base-images` (resolves current digests from the
+# upstream registry) when intentionally rolling forward.
+FROM cubejs/rust-builder:bookworm-llvm-18@sha256:9545a70ec86854a9f2aa5cd24f1b86b4efec8d46ba37450bb09ac7f25c1e2d3a AS builder
 
 WORKDIR /build/cubestore
 
@@ -28,7 +31,7 @@ COPY cubestore/cubestore cubestore
 RUN [ "$WITH_AVX2" -eq "1" ] && export RUSTFLAGS="-C target-feature=+avx2"; \
     cargo build --release -p cubestore
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
 
 WORKDIR /cube
 
