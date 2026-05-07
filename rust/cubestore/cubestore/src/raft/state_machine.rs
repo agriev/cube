@@ -313,6 +313,13 @@ impl RaftNode {
     }
 
     /// Propose a command and resolve the future once it has applied.
+    ///
+    /// PR-S2: bounded by `CUBESTORE_RAFT_PROPOSE_TIMEOUT_SECS` (default 30s).
+    /// A slow leader, a stalled apply path (RocksDB write stall, large
+    /// blob encode), or a partition where the local replica isn't actually
+    /// leader anymore would otherwise block the caller (typically an HTTP
+    /// handler) forever. Timeout returns `RaftError::ProposeTimeout` ->
+    /// `CubeError`, which the caller surfaces as a 503.
     pub async fn propose(&self, command: MetaCommand) -> Result<MetaCommandResult, CubeError> {
         let (tx, rx) = oneshot::channel();
         self.proposals
@@ -321,9 +328,17 @@ impl RaftNode {
                 respond_to: tx,
             })
             .map_err(|_| CubeError::internal("raft task is not running".to_string()))?;
-        rx.await.map_err(|_| {
-            CubeError::internal("raft task dropped the response channel".to_string())
-        })?
+        let timeout = propose_timeout();
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(CubeError::internal(
+                "raft task dropped the response channel".to_string(),
+            )),
+            Err(_) => Err(CubeError::internal(format!(
+                "raft propose timed out after {}s; check leader stability and apply queue depth",
+                timeout.as_secs()
+            ))),
+        }
     }
 
     /// M5.4 — handle to the underlying storage so the snapshot
@@ -358,6 +373,24 @@ impl RaftNode {
     /// to identify the speaker without dragging the config in.
     pub fn self_id(&self) -> u64 {
         self.self_id
+    }
+}
+
+/// Resolve the configured propose timeout (PR-S2). Reads
+/// `CUBESTORE_RAFT_PROPOSE_TIMEOUT_SECS`, falls back to 30s. A value of
+/// "0" disables the timeout (only useful in tests). The variable is
+/// re-read on every call — cheap and lets operators tune at runtime
+/// via `kubectl set env` without restarting the cube process.
+fn propose_timeout() -> Duration {
+    let secs = std::env::var("CUBESTORE_RAFT_PROPOSE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    if secs == 0 {
+        // Effectively unbounded; matches pre-PR-S2 behavior.
+        Duration::from_secs(60 * 60 * 24 * 365)
+    } else {
+        Duration::from_secs(secs)
     }
 }
 

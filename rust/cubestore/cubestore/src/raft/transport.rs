@@ -262,7 +262,15 @@ pub async fn spawn_listener(
     Ok(handle)
 }
 
+// PR-S2: tolerated parse-failure rate. We accept the occasional flexbuffer-
+// or protobuf-decode hiccup, but a peer flooding malformed frames would
+// keep the recv loop pinned indefinitely on `continue` without this cap.
+// After this many consecutive parse failures on the same connection we
+// drop the connection and let the next message reconnect.
+const MAX_CONSECUTIVE_PARSE_FAILS: u32 = 16;
+
 async fn run_recv_loop(mut sock: TcpStream, inbound: Inbound) -> std::io::Result<()> {
+    let mut consecutive_parse_fails: u32 = 0;
     loop {
         // Drop the per-frame magic+version+len header. EOF here is the
         // peer cleanly closing — return Ok and let the spawn task end.
@@ -298,9 +306,26 @@ async fn run_recv_loop(mut sock: TcpStream, inbound: Inbound) -> std::io::Result
         sock.read_exact(&mut buf).await?;
         let mut msg = Message::default();
         if let Err(e) = msg.merge_from_bytes(&buf) {
-            log::warn!("raft transport: dropping malformed frame: {}", e);
+            consecutive_parse_fails += 1;
+            log::warn!(
+                "raft transport: dropping malformed frame ({}/{}): {}",
+                consecutive_parse_fails,
+                MAX_CONSECUTIVE_PARSE_FAILS,
+                e
+            );
+            if consecutive_parse_fails >= MAX_CONSECUTIVE_PARSE_FAILS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "raft transport: peer exceeded {} consecutive malformed frames; \
+                         dropping connection (last error: {})",
+                        MAX_CONSECUTIVE_PARSE_FAILS, e
+                    ),
+                ));
+            }
             continue;
         }
+        consecutive_parse_fails = 0;
         inbound.feed(msg);
     }
 }
